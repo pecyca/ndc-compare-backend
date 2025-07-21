@@ -123,12 +123,12 @@ app.get('/api/shortage-status', async (req, res) => {
   }
 });
 
-// === /proxy/rxnav/:endpoint(*) ===
+// ✅ === /proxy/rxnav/:endpoint(*) === (with /REST prefix)
 app.get('/proxy/rxnav/:endpoint(*)', async (req, res) => {
   try {
     const search = req._parsedUrl.search || '';
     const endpoint = req.params.endpoint;
-    const targetUrl = `https://rxnav.nlm.nih.gov/${endpoint}${search}`;
+    const targetUrl = `https://rxnav.nlm.nih.gov/REST/${endpoint}${search}`;
     console.log(`🔁 Proxying RxNav call to: ${targetUrl}`);
 
     const response = await fetch(targetUrl);
