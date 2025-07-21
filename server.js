@@ -123,6 +123,30 @@ app.get('/api/shortage-status', async (req, res) => {
   }
 });
 
+// === /proxy/rxnav/:endpoint(*) ===
+app.get('/proxy/rxnav/:endpoint(*)', async (req, res) => {
+  try {
+    const search = req._parsedUrl.search || '';
+    const endpoint = req.params.endpoint;
+    const targetUrl = `https://rxnav.nlm.nih.gov/${endpoint}${search}`;
+    console.log(`🔁 Proxying RxNav call to: ${targetUrl}`);
+
+    const response = await fetch(targetUrl);
+    const contentType = response.headers.get('content-type');
+
+    if (!contentType?.includes('application/json')) {
+      return res.status(502).send({ error: 'Unexpected response from RxNav' });
+    }
+
+    const text = await response.text();
+    res.set('Content-Type', 'application/json');
+    res.send(text);
+  } catch (error) {
+    console.error('❌ RxNav Proxy Error:', error);
+    res.status(500).json({ error: 'Proxy to RxNav failed' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
 });
