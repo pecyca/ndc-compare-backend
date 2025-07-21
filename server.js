@@ -89,10 +89,34 @@ app.get('/api/shortage-status', async (req, res) => {
   if (!ndc) return res.status(400).json({ error: 'Missing NDC' });
 
   try {
-    const response = await fetch(`https://api.fda.gov/drug/shortages.json?search=product_ndc:"${ndc}"`);
-    const data = await response.json();
-    const inShortage = data.results && data.results.length > 0;
-    res.json({ inShortage });
+    const segments = ndc.split('-');
+    if (segments.length !== 3) return res.status(400).json({ error: 'Invalid NDC format' });
+
+    const labeler = segments[0].replace(/^0+/, '');
+    const product = segments[1].replace(/^0+/, '');
+    const packageCode = segments[2].replace(/^0+/, '');
+
+    const query = `
+      SELECT * FROM shortages
+      WHERE
+        REPLACE(Package_NDC_Code, '-', '') LIKE '%' || ? || '%' AND
+        REPLACE(Package_NDC_Code, '-', '') LIKE '%' || ? || '%' AND
+        REPLACE(Package_NDC_Code, '-', '') LIKE '%' || ? || '%'
+      LIMIT 1
+    `;
+
+    const result = await db.get(query, [labeler, product, packageCode]);
+
+    if (result) {
+      res.json({
+        inShortage: true,
+        productName: result.Proprietary_Name || null,
+        ndc: result.Package_NDC_Code || null,
+        reason: result.Shortage_Reason || null
+      });
+    } else {
+      res.json({ inShortage: false });
+    }
   } catch (err) {
     console.error('❌ /api/shortage-status error:', err);
     res.status(500).json({ error: 'Error checking shortage status' });
