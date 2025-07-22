@@ -4,7 +4,7 @@ import cors from 'cors';
 import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
 import path from 'path';
-import fetch from 'node-fetch'; // ✅ Only here, at top level
+import fetch from 'node-fetch';
 import { fileURLToPath } from 'url';
 
 const app = express();
@@ -26,11 +26,11 @@ let db;
   console.log('✅ SQLite DB connected');
 })();
 
-// === Proxy RxNav ===
-app.get('/proxy/rxnav/:endpoint', async (req, res) => {
-  const endpoint = req.params.endpoint;
+// === ✅ Proxy RxNav with wildcard support ===
+app.get('/proxy/rxnav/*', async (req, res) => {
+  const subpath = req.params[0]; // everything after /proxy/rxnav/
   const query = new URLSearchParams(req.query).toString();
-  const url = `https://rxnav.nlm.nih.gov/REST/${endpoint}?${query}`;
+  const url = `https://rxnav.nlm.nih.gov/REST/${subpath}?${query}`;
 
   try {
     const response = await fetch(url);
@@ -99,7 +99,7 @@ app.get('/query', async (req, res) => {
   try {
     const result = await db.get(
       `SELECT * FROM orangebook WHERE PRODUCTNDC = ? OR PRODUCTNDC LIKE ?`,
-      [ndc, `%${ndc.slice(-6)}`] // fallback for padded/unpadded NDC
+      [ndc, `%${ndc.slice(-6)}`]
     );
 
     if (result) {
@@ -113,12 +113,12 @@ app.get('/query', async (req, res) => {
   }
 });
 
-// === Default health check ===
+// === Health Check ===
 app.get('/', (req, res) => {
   res.send('✅ Backend is live and running');
 });
 
-// === Launch ===
+// === Start Server ===
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
