@@ -15,7 +15,7 @@ app.use(express.json());
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const dbPath = path.join(__dirname, 'fda_merged_tecode.sqlite');
+const dbPath = path.join(__dirname, 'orangebook_combined.sqlite');
 
 let db;
 (async () => {
@@ -26,9 +26,9 @@ let db;
   console.log('✅ SQLite DB connected');
 })();
 
-// === ✅ Proxy RxNav with wildcard support ===
+// === RxNav Proxy ===
 app.get('/proxy/rxnav/*', async (req, res) => {
-  const subpath = req.params[0]; // everything after /proxy/rxnav/
+  const subpath = req.params[0];
   const query = new URLSearchParams(req.query).toString();
   const url = `https://rxnav.nlm.nih.gov/REST/${subpath}?${query}`;
 
@@ -50,23 +50,53 @@ app.get('/proxy/rxnav/*', async (req, res) => {
   }
 });
 
-// === NDC Shortage Status ===
+// === Discontinued Status ===
+app.get('/discontinued-status', async (req, res) => {
+  const ndc = req.query.ndc;
+  if (!ndc) return res.status(400).json({ error: 'Missing NDC' });
+
+  try {
+    const result = await db.get(
+      `SELECT Matched_ENDMARKETINGDATE FROM orangebook_combined WHERE Matched_PRODUCTNDC = ?`,
+      [ndc]
+    );
+
+    const now = new Date();
+    let discontinued = false;
+
+    if (result?.Matched_ENDMARKETINGDATE) {
+      const dateStr = result.Matched_ENDMARKETINGDATE;
+      if (/^\d{8}$/.test(dateStr)) {
+        const y = parseInt(dateStr.slice(0, 4));
+        const m = parseInt(dateStr.slice(4, 6)) - 1;
+        const d = parseInt(dateStr.slice(6, 8));
+        const endDate = new Date(Date.UTC(y, m, d));
+        discontinued = endDate < now;
+      }
+    }
+
+    res.json({ discontinued });
+  } catch (err) {
+    console.error('Discontinued error:', err.message);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// === Shortage Status ===
 app.get('/shortage-status', async (req, res) => {
   const ndc = req.query.ndc;
   if (!ndc) return res.status(400).json({ error: 'Missing NDC' });
 
   try {
     const result = await db.get(
-      `SELECT inShortage, reason FROM fda_shortages WHERE ndc = ?`,
+      `SELECT Reason_for_Shortage FROM shortages WHERE Package_NDC_Code = ?`,
       [ndc]
     );
+
     if (result) {
-      res.json({
-        inShortage: result.inShortage === 1,
-        reason: result.reason || null
-      });
+      res.json({ inShortage: true, reason: result.Reason_for_Shortage || null });
     } else {
-      res.status(404).json({ inShortage: false });
+      res.json({ inShortage: false });
     }
   } catch (err) {
     console.error('Shortage DB error:', err.message);
@@ -74,42 +104,42 @@ app.get('/shortage-status', async (req, res) => {
   }
 });
 
-// === NDC Discontinued Status ===
-app.get('/discontinued-status', async (req, res) => {
+// === Orange Book Equivalence Query ===
+app.get('/equivalence', async (req, res) => {
   const ndc = req.query.ndc;
   if (!ndc) return res.status(400).json({ error: 'Missing NDC' });
 
   try {
-    const result = await db.get(
-      `SELECT discontinued FROM fda_discontinued WHERE ndc = ?`,
+    const row = await db.get(
+      `SELECT * FROM orangebook_combined WHERE Matched_PRODUCTNDC = ?`,
       [ndc]
     );
-    res.json({ discontinued: !!result?.discontinued });
-  } catch (err) {
-    console.error('Discontinued DB error:', err.message);
-    res.status(500).json({ error: 'Internal error' });
-  }
-});
 
-// === Orange Book Query by NDC ===
-app.get('/query', async (req, res) => {
-  const ndc = req.query.ndc;
-  if (!ndc) return res.status(400).json({ error: 'Missing NDC' });
-
-  try {
-    const result = await db.get(
-      `SELECT * FROM orangebook WHERE PRODUCTNDC = ? OR PRODUCTNDC LIKE ?`,
-      [ndc, `%${ndc.slice(-6)}`]
-    );
-
-    if (result) {
-      res.json(result);
-    } else {
-      res.status(404).json({ error: 'Not found' });
+    if (!row) {
+      return res.status(404).json({ match: false, message: 'Unable to retrieve Orange Book data' });
     }
+
+    const { Ingredient, Matched_ACTIVE_NUMERATOR_STRENGTH, Matched_DOSAGEFORMNAME, TE_Code } = row;
+
+    if (!Ingredient || !Matched_ACTIVE_NUMERATOR_STRENGTH || !Matched_DOSAGEFORMNAME) {
+      return res.status(404).json({ match: false, message: 'Unable to retrieve Orange Book data' });
+    }
+
+    const response = {
+      match: true,
+      ingredient: Ingredient,
+      strength: Matched_ACTIVE_NUMERATOR_STRENGTH,
+      form: Matched_DOSAGEFORMNAME,
+      teCode: TE_Code || null,
+      message: TE_Code
+        ? `Matched with TE Code: ${TE_Code}`
+        : 'Match found, but TE Code unavailable'
+    };
+
+    res.json(response);
   } catch (err) {
-    console.error('Orange Book query error:', err.message);
-    res.status(500).json({ error: 'Query failure' });
+    console.error('Equivalence query error:', err.message);
+    res.status(500).json({ error: 'Internal error' });
   }
 });
 
