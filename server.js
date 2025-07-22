@@ -22,17 +22,28 @@ let db;
   console.log('✅ SQLite DB connected');
 })();
 
-// === NDC Normalization (Preserve Leading Zeros) ===
-function normalizeNdcForProduct(ndc) {
-  const digits = ndc.replace(/[^0-9]/g, '').padStart(11, '0');
-  const match = digits.match(/^(\d{5})(\d{4})(\d{2})$/);
-  return match ? `${match[1]}-${match[2]}` : ndc;
+// === NDC Normalization ===
+function stripLeadingZeros(segment) {
+  return segment.replace(/^0+/, '');
 }
 
-function normalizeNdcForPackage(ndc) {
-  const digits = ndc.replace(/[^0-9]/g, '').padStart(11, '0');
+function normalizeNdcToProductOnly(ndc) {
+  const digits = ndc.replace(/\D/g, '').padStart(11, '0');
   const match = digits.match(/^(\d{5})(\d{4})(\d{2})$/);
-  return match ? `${match[1]}-${match[2]}-${match[3]}` : ndc;
+  return match ? `${stripLeadingZeros(match[1])}-${stripLeadingZeros(match[2])}` : ndc;
+}
+
+function normalizeNdcToFull(ndc) {
+  const digits = ndc.replace(/\D/g, '').padStart(11, '0');
+  const match = digits.match(/^(\d{5})(\d{4})(\d{2})$/);
+  return match ? `${stripLeadingZeros(match[1])}-${stripLeadingZeros(match[2])}-${stripLeadingZeros(match[3])}` : ndc;
+}
+
+function normalizeDbNdc(value) {
+  return value
+    .split('-')
+    .map(segment => stripLeadingZeros(segment))
+    .join('-');
 }
 
 // === RxNav Proxy ===
@@ -43,7 +54,7 @@ app.get('/proxy/rxnav/*', async (req, res) => {
   try {
     const response = await fetch(url);
     const contentType = response.headers.get('content-type');
-    if (contentType && contentType.includes('application/json')) {
+    if (contentType?.includes('application/json')) {
       const data = await response.json();
       res.json(data);
     } else {
@@ -61,17 +72,17 @@ app.get('/proxy/rxnav/*', async (req, res) => {
 app.get('/discontinued-status', async (req, res) => {
   const ndc = req.query.ndc;
   if (!ndc) return res.status(400).json({ error: 'Missing NDC' });
-  const normalized = normalizeNdcForProduct(ndc);
+  const normalized = normalizeNdcToProductOnly(ndc);
   try {
-    const result = await db.get(`SELECT Matched_ENDMARKETINGDATE FROM orangebook_combined WHERE Matched_PRODUCTNDC = ?`, [normalized]);
-    const now = new Date();
+    const rows = await db.all(`SELECT Matched_ENDMARKETINGDATE, Matched_PRODUCTNDC FROM orangebook_combined`);
+    const match = rows.find(row => normalizeDbNdc(row.Matched_PRODUCTNDC) === normalized);
+    if (!match) return res.json({ discontinued: false });
+
+    const end = match.Matched_ENDMARKETINGDATE;
     let discontinued = false;
-    if (result?.Matched_ENDMARKETINGDATE && /^\d{8}$/.test(result.Matched_ENDMARKETINGDATE)) {
-      const y = parseInt(result.Matched_ENDMARKETINGDATE.slice(0, 4));
-      const m = parseInt(result.Matched_ENDMARKETINGDATE.slice(4, 6)) - 1;
-      const d = parseInt(result.Matched_ENDMARKETINGDATE.slice(6, 8));
-      const endDate = new Date(Date.UTC(y, m, d));
-      discontinued = endDate < now;
+    if (end && /^\d{8}$/.test(end)) {
+      const y = parseInt(end.slice(0, 4)), m = parseInt(end.slice(4, 6)) - 1, d = parseInt(end.slice(6, 8));
+      discontinued = new Date(Date.UTC(y, m, d)) < new Date();
     }
     res.json({ discontinued });
   } catch (err) {
@@ -80,18 +91,16 @@ app.get('/discontinued-status', async (req, res) => {
   }
 });
 
-// === Shortage Status (with LIKE fallback) ===
+// === Shortage Status ===
 app.get('/shortage-status', async (req, res) => {
   const ndc = req.query.ndc;
   if (!ndc) return res.status(400).json({ error: 'Missing NDC' });
-  const normalized = normalizeNdcForPackage(ndc);
+  const normalized = normalizeNdcToFull(ndc);
   try {
-    let result = await db.get(`SELECT Reason_for_Shortage FROM shortages WHERE Package_NDC_Code = ?`, [normalized]);
-    if (!result) {
-      result = await db.get(`SELECT Reason_for_Shortage FROM shortages WHERE Package_NDC_Code LIKE ?`, [`%${normalized}`]);
-    }
-    if (result) {
-      res.json({ inShortage: true, reason: result.Reason_for_Shortage || null });
+    const rows = await db.all(`SELECT Package_NDC_Code, Reason_for_Shortage FROM shortages`);
+    const match = rows.find(row => normalizeDbNdc(row.Package_NDC_Code) === normalized);
+    if (match) {
+      res.json({ inShortage: true, reason: match.Reason_for_Shortage || null });
     } else {
       res.json({ inShortage: false });
     }
@@ -101,20 +110,18 @@ app.get('/shortage-status', async (req, res) => {
   }
 });
 
-// === Orange Book Equivalence Query (with LIKE fallback + partial return) ===
+// === Orange Book Equivalence ===
 app.get('/equivalence', async (req, res) => {
   const ndc = req.query.ndc;
   if (!ndc) return res.status(400).json({ error: 'Missing NDC' });
-  const normalized = normalizeNdcForProduct(ndc);
+  const normalized = normalizeNdcToProductOnly(ndc);
   try {
-    let row = await db.get(`SELECT * FROM orangebook_combined WHERE Matched_PRODUCTNDC = ?`, [normalized]);
-    if (!row) {
-      row = await db.get(`SELECT * FROM orangebook_combined WHERE Matched_PRODUCTNDC LIKE ?`, [`%${normalized}`]);
-    }
-    if (!row) {
+    const rows = await db.all(`SELECT * FROM orangebook_combined`);
+    const match = rows.find(row => normalizeDbNdc(row.Matched_PRODUCTNDC) === normalized);
+    if (!match) {
       return res.status(404).json({ match: false, message: 'Unable to retrieve Orange Book data' });
     }
-    const { Ingredient, Matched_ACTIVE_NUMERATOR_STRENGTH, Matched_DOSAGEFORMNAME, TE_Code } = row;
+    const { Ingredient, Matched_ACTIVE_NUMERATOR_STRENGTH, Matched_DOSAGEFORMNAME, TE_Code } = match;
     res.json({
       match: true,
       ingredient: Ingredient || null,
