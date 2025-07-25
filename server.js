@@ -1,5 +1,4 @@
 // server.js
-
 import express from 'express';
 import cors from 'cors';
 import sqlite3 from 'sqlite3';
@@ -16,7 +15,7 @@ app.use(express.json());
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const dbPath = path.join(__dirname, 'orangebook_combined.sqlite');
+const dbPath = path.join(__dirname, 'merged_ndc_all_records.sqlite');
 
 let db;
 (async () => {
@@ -24,7 +23,6 @@ let db;
   console.log('✅ SQLite DB connected');
 })();
 
-// === NDC Normalization ===
 function stripLeadingZeros(segment) {
   return segment.replace(/^0+/, '');
 }
@@ -41,7 +39,6 @@ function normalizeNdcToFull(ndc) {
   return match ? `${stripLeadingZeros(match[1])}-${stripLeadingZeros(match[2])}-${stripLeadingZeros(match[3])}` : ndc;
 }
 
-// === RxNav Proxy ===
 app.get('/proxy/rxnav/*', async (req, res) => {
   const subpath = req.params[0];
   const query = new URLSearchParams(req.query).toString();
@@ -54,7 +51,7 @@ app.get('/proxy/rxnav/*', async (req, res) => {
       res.json(data);
     } else {
       const text = await response.text();
-      console.error('⚠️ RxNav response was not JSON:\n', text);
+      console.error(⚠️ RxNav response was not JSON:\n', text);
       res.status(502).send('RxNav did not return JSON');
     }
   } catch (err) {
@@ -63,14 +60,13 @@ app.get('/proxy/rxnav/*', async (req, res) => {
   }
 });
 
-// === Discontinued Status ===
 app.get('/discontinued-status', async (req, res) => {
   const ndc = req.query.ndc;
   if (!ndc) return res.status(400).json({ error: 'Missing NDC' });
   const normalized = normalizeNdcToProductOnly(ndc);
   try {
     const row = await db.get(
-      `SELECT Matched_ENDMARKETINGDATE FROM orangebook_combined WHERE Normalized_PRODUCTNDC = ?`,
+      `SELECT Matched_ENDMARKETINGDATE FROM ndc_data WHERE normalizedNDC = ?`,
       [normalized]
     );
     let discontinued = false;
@@ -88,7 +84,6 @@ app.get('/discontinued-status', async (req, res) => {
   }
 });
 
-// === Shortage Status ===
 app.get('/shortage-status', async (req, res) => {
   const ndc = req.query.ndc;
   if (!ndc) return res.status(400).json({ error: 'Missing NDC' });
@@ -109,62 +104,44 @@ app.get('/shortage-status', async (req, res) => {
   }
 });
 
-// === Orange Book Equivalence Summary ===
-app.get('/equivalence', async (req, res) => {
-  const ndc = req.query.ndc;
-  if (!ndc) return res.status(400).json({ error: 'Missing NDC' });
-  const normalized = normalizeNdcToProductOnly(ndc);
-  try {
-    const row = await db.get(
-      `SELECT * FROM orangebook_combined WHERE Normalized_PRODUCTNDC = ?`,
-      [normalized]
-    );
-    if (!row) {
-      return res.status(404).json({ match: false, message: 'Unable to retrieve Orange Book data' });
-    }
-    const { Ingredient, Matched_ACTIVE_NUMERATOR_STRENGTH, Matched_DOSAGEFORMNAME, TE_Code } = row;
-    res.json({
-      match: true,
-      ingredient: Ingredient || null,
-      strength: Matched_ACTIVE_NUMERATOR_STRENGTH || null,
-      form: Matched_DOSAGEFORMNAME || null,
-      teCode: TE_Code || null,
-      message: TE_Code ? `Matched with TE Code: ${TE_Code}` : 'Match found, but TE Code unavailable'
-    });
-  } catch (err) {
-    console.error('Equivalence query error:', err.message);
-    res.status(500).json({ error: 'Internal error' });
-  }
-});
-
-// === Orange Book Full Record Query ===
-app.get('/query', async (req, res) => {
+app.get('/ndc-lookup', async (req, res) => {
   const ndc = req.query.ndc;
   if (!ndc) return res.status(400).json({ error: 'Missing NDC' });
 
   const normalized = normalizeNdcToProductOnly(ndc);
 
   try {
-    const row = await db.get(
-      `SELECT * FROM orangebook_combined WHERE Normalized_PRODUCTNDC = ?`,
-      [normalized]
-    );
-    if (!row) {
-      return res.status(404).json({ error: 'No Orange Book match found' });
+    const row = await db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [normalized]);
+    if (!row) return res.status(404).json({ error: 'NDC not found' });
+
+    let inferredRxcui = row.rxcui || null;
+    let inferredGpi = row.gpiCode || null;
+
+    if (!inferredRxcui) {
+      try {
+        const response = await fetch(
+          `https://rxnav.nlm.nih.gov/REST/ndcstatus.json?ndc=${ndc}`
+        );
+        const json = await response.json();
+        inferredRxcui = json?.ndcStatus?.rxCui || null;
+      } catch (err) {
+        console.warn('RxCUI inference failed:', err.message);
+      }
     }
-    res.json(row);
+
+    // GPI inference can be plugged here later
+
+    res.json({ ...row, inferredRxcui, inferredGpi });
   } catch (err) {
-    console.error('❌ Query route error:', err.message);
+    console.error('NDC lookup error:', err.message);
     res.status(500).json({ error: 'Internal error' });
   }
 });
 
-// === Health Check ===
 app.get('/', (req, res) => {
   res.send('✅ Backend is live and running');
 });
 
-// === Start Server ===
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
