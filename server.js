@@ -20,7 +20,7 @@ const dbPath = path.join(__dirname, 'merged_ndc_all_records.sqlite');
 let db;
 (async () => {
   db = await open({ filename: dbPath, driver: sqlite3.Database });
-  console.log('✅ SQLite DB connected');
+  console.log('SQLite DB connected');
 })();
 
 function stripLeadingZeros(segment) {
@@ -51,7 +51,7 @@ app.get('/proxy/rxnav/*', async (req, res) => {
       res.json(data);
     } else {
       const text = await response.text();
-      console.error(⚠️ RxNav response was not JSON:\n', text);
+      console.error('RxNav response was not JSON:\n', text);
       res.status(502).send('RxNav did not return JSON');
     }
   } catch (err) {
@@ -129,8 +129,6 @@ app.get('/ndc-lookup', async (req, res) => {
       }
     }
 
-    // GPI inference can be plugged here later
-
     res.json({ ...row, inferredRxcui, inferredGpi });
   } catch (err) {
     console.error('NDC lookup error:', err.message);
@@ -139,9 +137,9 @@ app.get('/ndc-lookup', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.send('✅ Backend is live and running');
+  res.send('Backend is live and running');
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
