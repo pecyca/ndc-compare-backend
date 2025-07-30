@@ -1,4 +1,4 @@
-// === ✅ FULL UPDATED server.js with Comments Support ===
+// === ✅ FULL MERGED server.js with /ndc-lookup and Comments Support ===
 
 import express from 'express';
 import cors from 'cors';
@@ -37,6 +37,25 @@ function normalizeNdcToFullDashed(ndc) {
     const match = digits.match(/^(\d{5})(\d{4})(\d{2})$/);
     return match ? `${stripLeadingZeros(match[1])}-${stripLeadingZeros(match[2])}-${stripLeadingZeros(match[3])}` : ndc;
 }
+
+// === 🔍 /ndc-lookup ===
+app.get('/ndc-lookup', async (req, res) => {
+    const rawNdc = req.query.ndc || '';
+    const normalized = normalizeNdcToDigitsOnly(rawNdc);
+
+    if (!normalized || normalized.length !== 11) {
+        return res.status(400).json({ error: 'Invalid NDC format' });
+    }
+
+    try {
+        const row = await db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [normalized]);
+        if (!row) return res.status(404).json({ error: 'NDC not found' });
+        res.json(row);
+    } catch (err) {
+        console.error('❌ /ndc-lookup error:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
 
 // === /search-ndc ===
 app.get('/search-ndc', async (req, res) => {
