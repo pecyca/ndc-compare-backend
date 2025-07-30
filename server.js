@@ -145,6 +145,42 @@ app.get('/', (req, res) => {
   res.send('✅ NDC Compare Backend is live');
 });
 
+// === /search-ndc ===
+app.get('/search-ndc', async (req, res) => {
+    const q = (req.query.q || '').trim().toLowerCase();
+    if (!q || q.length < 3) {
+        return res.status(400).json({ error: 'Query too short' });
+    }
+
+    const digits = q.replace(/\D/g, '');
+    const queryParam = `%${digits}%`;
+
+    try {
+        const rows = await db.all(`
+      SELECT ndc, normalizedNDC, brandName, genericName, strength
+      FROM ndc_data
+      WHERE
+        ndc LIKE ? OR
+        normalizedNDC LIKE ? OR
+        LOWER(brandName) LIKE ? OR
+        LOWER(genericName) LIKE ?
+      LIMIT 12
+    `, [queryParam, queryParam, `%${q}%`, `%${q}%`]);
+
+        const results = rows.map(row => ({
+            ndc: row.ndc || row.normalizedNDC,
+            brandName: row.brandName,
+            genericName: row.genericName,
+            strength: row.strength
+        }));
+
+        res.json({ results });
+    } catch (err) {
+        console.error('❌ /search-ndc error:', err.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
