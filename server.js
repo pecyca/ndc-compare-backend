@@ -1,4 +1,4 @@
-// === ✅ FULL UPDATED server.js ===
+// server.js
 import express from 'express';
 import cors from 'cors';
 import sqlite3 from 'sqlite3';
@@ -23,7 +23,7 @@ let db;
     console.log('✅ SQLite DB connected');
 })();
 
-// === NDC Normalization Utilities ===
+// === Normalization ===
 function stripLeadingZeros(segment) {
     return segment.replace(/^0+/, '');
 }
@@ -64,37 +64,33 @@ app.get('/proxy/rxnav/*', async (req, res) => {
 });
 
 // === /ndc-lookup ===
-// === /search-ndc (improved matching using gpiNDC) ===
-app.get('/search-ndc', async (req, res) => {
-    const q = (req.query.q || '').trim().toLowerCase();
-    if (!q || q.length < 3) return res.status(400).json({ error: 'Query too short' });
+app.get('/ndc-lookup', async (req, res) => {
+    const ndc = req.query.ndc;
+    if (!ndc) return res.status(400).json({ error: 'Missing NDC' });
 
-    const likeRaw = `%${q}%`;
-    const digitsOnly = q.replace(/\D/g, '');
-    const likeDigits = `%${digitsOnly}%`;
-
+    const normalized = normalizeNdcToProductOnly(ndc);
     try {
-        const rows = await db.all(`
-            SELECT ndc, gpiNDC, brandName, genericName, strength
-            FROM ndc_data
-            WHERE
-                REPLACE(REPLACE(REPLACE(gpiNDC, '-', ''), '.', ''), ' ', '') LIKE ? OR
-                LOWER(brandName) LIKE ? OR
-                LOWER(genericName) LIKE ? OR
-                LOWER(substanceName) LIKE ?
-            LIMIT 12
-        `, [likeDigits, likeRaw, likeRaw, likeRaw]);
+        const row = await db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [normalized]);
 
-        const results = rows.map(row => ({
-            ndc: row.ndc,
-            brandName: row.brandName,
-            genericName: row.genericName,
-            strength: row.strength
-        }));
+        if (!row) return res.status(404).json({ error: 'NDC not found' });
 
-        res.json({ results });
+        let inferredRxcui = row.rxcui || null;
+        let inferredGpi = row.gpiCode || null;
+
+        // Infer RxCUI if missing
+        if (!inferredRxcui) {
+            try {
+                const response = await fetch(`https://rxnav.nlm.nih.gov/REST/ndcstatus.json?ndc=${ndc}`);
+                const json = await response.json();
+                inferredRxcui = json?.ndcStatus?.rxCui || null;
+            } catch (err) {
+                console.warn('RxCUI inference failed:', err.message);
+            }
+        }
+
+        res.json({ ...row, inferredRxcui, inferredGpi });
     } catch (err) {
-        console.error('❌ /search-ndc error:', err.message);
+        console.error('❌ /ndc-lookup error:', err.message);
         res.status(500).json({ error: 'Internal error' });
     }
 });
@@ -106,12 +102,9 @@ app.get('/discontinued-status', async (req, res) => {
 
     const normalized = normalizeNdcToProductOnly(ndc);
     try {
-        const row = await db.get(
-            `SELECT Matched_ENDMARKETINGDATE FROM ndc_data WHERE normalizedNDC = ?`,
-            [normalized]
-        );
-
+        const row = await db.get(`SELECT Matched_ENDMARKETINGDATE FROM ndc_data WHERE normalizedNDC = ?`, [normalized]);
         let discontinued = false;
+
         if (row?.Matched_ENDMARKETINGDATE && /^\d{8}$/.test(row.Matched_ENDMARKETINGDATE)) {
             const y = parseInt(row.Matched_ENDMARKETINGDATE.slice(0, 4));
             const m = parseInt(row.Matched_ENDMARKETINGDATE.slice(4, 6)) - 1;
@@ -134,10 +127,7 @@ app.get('/shortage-status', async (req, res) => {
 
     const normalized = normalizeNdcToFull(ndc);
     try {
-        const row = await db.get(
-            `SELECT Reason_for_Shortage FROM shortages WHERE Normalized_PackageNDC = ?`,
-            [normalized]
-        );
+        const row = await db.get(`SELECT Reason_for_Shortage FROM shortages WHERE Normalized_PackageNDC = ?`, [normalized]);
 
         if (row) {
             res.json({ inShortage: true, reason: row.Reason_for_Shortage || null });
@@ -146,43 +136,6 @@ app.get('/shortage-status', async (req, res) => {
         }
     } catch (err) {
         console.error('❌ /shortage-status error:', err.message);
-        res.status(500).json({ error: 'Internal error' });
-    }
-});
-
-// === ✅ /search-ndc (Fixed) ===
-app.get('/search-ndc', async (req, res) => {
-    const q = (req.query.q || '').trim().toLowerCase();
-    if (!q || q.length < 3) {
-        return res.status(400).json({ error: 'Query too short' });
-    }
-
-    const digits = q.replace(/\D/g, '');
-    const likeDigits = `%${digits}%`;
-    const likeQ = `%${q}%`;
-
-    try {
-        const rows = await db.all(`
-            SELECT normalizedNDC, brandName, genericName, strength
-            FROM ndc_data
-            WHERE
-                REPLACE(REPLACE(REPLACE(normalizedNDC, '-', ''), '.', ''), ' ', '') LIKE ? OR
-                LOWER(brandName) LIKE ? OR
-                LOWER(genericName) LIKE ? OR
-                LOWER(substanceName) LIKE ?
-            LIMIT 12
-        `, [likeDigits, likeQ, likeQ, likeQ]);
-
-        const results = rows.map(row => ({
-            ndc: row.normalizedNDC,
-            brandName: row.brandName,
-            genericName: row.genericName,
-            strength: row.strength
-        }));
-
-        res.json({ results });
-    } catch (err) {
-        console.error('❌ /search-ndc error:', err.message);
         res.status(500).json({ error: 'Internal error' });
     }
 });
