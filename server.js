@@ -153,26 +153,22 @@ app.get('/search-ndc', async (req, res) => {
     }
 
     const digits = q.replace(/\D/g, '');
-    const likeDigits = `%${digits}%`;
-    const likeText = `%${q}%`;
+    const queryParam = `%${digits}%`;
 
     try {
-        const rows = await db.all(
-            `
-      SELECT ndc, normalizedNDC, brandName, genericName, strength
-      FROM ndc_data
-      WHERE
-        ndc LIKE ? OR
-        normalizedNDC LIKE ? OR
-        LOWER(brandName) LIKE ? OR
-        LOWER(genericName) LIKE ?
-      LIMIT 12
-    `,
-            [likeDigits, likeDigits, likeText, likeText]
-        );
+        const rows = await db.all(`
+            SELECT normalizedNDC, brandName, genericName, strength
+            FROM ndc_data
+            WHERE
+                normalizedNDC LIKE ? OR
+                LOWER(brandName) LIKE ? OR
+                LOWER(genericName) LIKE ? OR
+                LOWER(substanceName) LIKE ?
+            LIMIT 12
+        `, [queryParam, `%${q}%`, `%${q}%`, `%${q}%`]);
 
         const results = rows.map(row => ({
-            ndc: row.ndc || row.normalizedNDC,
+            ndc: row.normalizedNDC,
             brandName: row.brandName,
             genericName: row.genericName,
             strength: row.strength
