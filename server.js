@@ -64,31 +64,37 @@ app.get('/proxy/rxnav/*', async (req, res) => {
 });
 
 // === /ndc-lookup ===
-app.get('/ndc-lookup', async (req, res) => {
-    const ndc = req.query.ndc;
-    if (!ndc) return res.status(400).json({ error: 'Missing NDC' });
+// === /search-ndc (improved matching using gpiNDC) ===
+app.get('/search-ndc', async (req, res) => {
+    const q = (req.query.q || '').trim().toLowerCase();
+    if (!q || q.length < 3) return res.status(400).json({ error: 'Query too short' });
 
-    const normalized = normalizeNdcToProductOnly(ndc);
+    const likeRaw = `%${q}%`;
+    const digitsOnly = q.replace(/\D/g, '');
+    const likeDigits = `%${digitsOnly}%`;
+
     try {
-        const row = await db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [normalized]);
-        if (!row) return res.status(404).json({ error: 'NDC not found' });
+        const rows = await db.all(`
+            SELECT ndc, gpiNDC, brandName, genericName, strength
+            FROM ndc_data
+            WHERE
+                REPLACE(REPLACE(REPLACE(gpiNDC, '-', ''), '.', ''), ' ', '') LIKE ? OR
+                LOWER(brandName) LIKE ? OR
+                LOWER(genericName) LIKE ? OR
+                LOWER(substanceName) LIKE ?
+            LIMIT 12
+        `, [likeDigits, likeRaw, likeRaw, likeRaw]);
 
-        let inferredRxcui = row.rxcui || null;
-        let inferredGpi = row.gpiCode || null;
+        const results = rows.map(row => ({
+            ndc: row.ndc,
+            brandName: row.brandName,
+            genericName: row.genericName,
+            strength: row.strength
+        }));
 
-        if (!inferredRxcui) {
-            try {
-                const response = await fetch(`https://rxnav.nlm.nih.gov/REST/ndcstatus.json?ndc=${ndc}`);
-                const json = await response.json();
-                inferredRxcui = json?.ndcStatus?.rxCui || null;
-            } catch (err) {
-                console.warn('RxCUI inference failed:', err.message);
-            }
-        }
-
-        res.json({ ...row, inferredRxcui, inferredGpi });
+        res.json({ results });
     } catch (err) {
-        console.error('❌ /ndc-lookup error:', err.message);
+        console.error('❌ /search-ndc error:', err.message);
         res.status(500).json({ error: 'Internal error' });
     }
 });
