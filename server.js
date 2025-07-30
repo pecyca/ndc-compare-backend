@@ -1,4 +1,4 @@
-// server.js
+// === ✅ FULL UPDATED server.js ===
 import express from 'express';
 import cors from 'cors';
 import sqlite3 from 'sqlite3';
@@ -23,7 +23,7 @@ let db;
     console.log('✅ SQLite DB connected');
 })();
 
-// === Normalization ===
+// === NDC Normalization Utilities ===
 function stripLeadingZeros(segment) {
     return segment.replace(/^0+/, '');
 }
@@ -76,7 +76,6 @@ app.get('/ndc-lookup', async (req, res) => {
         let inferredRxcui = row.rxcui || null;
         let inferredGpi = row.gpiCode || null;
 
-        // Infer RxCUI if missing
         if (!inferredRxcui) {
             try {
                 const response = await fetch(`https://rxnav.nlm.nih.gov/REST/ndcstatus.json?ndc=${ndc}`);
@@ -145,7 +144,7 @@ app.get('/shortage-status', async (req, res) => {
     }
 });
 
-// === /search-ndc ===
+// === ✅ /search-ndc (Fixed) ===
 app.get('/search-ndc', async (req, res) => {
     const q = (req.query.q || '').trim().toLowerCase();
     if (!q || q.length < 3) {
@@ -153,19 +152,20 @@ app.get('/search-ndc', async (req, res) => {
     }
 
     const digits = q.replace(/\D/g, '');
-    const queryParam = `%${digits}%`;
+    const likeDigits = `%${digits}%`;
+    const likeQ = `%${q}%`;
 
     try {
         const rows = await db.all(`
             SELECT normalizedNDC, brandName, genericName, strength
             FROM ndc_data
             WHERE
-                normalizedNDC LIKE ? OR
+                REPLACE(REPLACE(REPLACE(normalizedNDC, '-', ''), '.', ''), ' ', '') LIKE ? OR
                 LOWER(brandName) LIKE ? OR
                 LOWER(genericName) LIKE ? OR
                 LOWER(substanceName) LIKE ?
             LIMIT 12
-        `, [queryParam, `%${q}%`, `%${q}%`, `%${q}%`]);
+        `, [likeDigits, likeQ, likeQ, likeQ]);
 
         const results = rows.map(row => ({
             ndc: row.normalizedNDC,
