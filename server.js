@@ -32,24 +32,26 @@ function normalizeNdcToDigitsOnly(ndc) {
     return ndc.replace(/\D/g, '').padStart(11, '0');
 }
 
-function normalizeNdcToFullDashed(ndc) {
-    const digits = normalizeNdcToDigitsOnly(ndc);
+function normalizeNdcToProductOnly(ndc) {
+    const digits = ndc.replace(/\D/g, '').padStart(11, '0');
     const match = digits.match(/^(\d{5})(\d{4})(\d{2})$/);
-    return match ? `${stripLeadingZeros(match[1])}-${stripLeadingZeros(match[2])}-${stripLeadingZeros(match[3])}` : ndc;
+    if (!match) return ndc;
+    const [_, labeler, product] = match;
+    return `${stripLeadingZeros(labeler)}-${stripLeadingZeros(product)}`;
 }
 
 // === 🔍 /ndc-lookup ===
 app.get('/ndc-lookup', async (req, res) => {
     const rawNdc = req.query.ndc || '';
-    const normalized = normalizeNdcToDigitsOnly(rawNdc);
+    const normalized = normalizeNdcToProductOnly(rawNdc);
 
-    if (!normalized || normalized.length !== 11) {
+    if (!normalized.includes('-')) {
         return res.status(400).json({ error: 'Invalid NDC format' });
     }
 
     try {
         const row = await db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [normalized]);
-        if (!row) return res.status(404).json({ error: 'NDC not found' });
+        if (!row) return res.status(404).json({ error: `NDC ${normalized} not found` });
         res.json(row);
     } catch (err) {
         console.error('❌ /ndc-lookup error:', err.message);
