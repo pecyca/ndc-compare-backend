@@ -19,10 +19,22 @@ const __dirname = path.dirname(__filename);
 const dbPath = path.join(__dirname, 'merged_ndc_all_records.sqlite');
 
 let db;
-(async () => {
-    db = await open({ filename: dbPath, driver: sqlite3.Database });
-    console.log('✅ SQLite DB connected');
-})();
+
+async function startServer() {
+    try {
+        db = await open({ filename: dbPath, driver: sqlite3.Database });
+        console.log('✅ SQLite DB connected');
+
+        app.listen(PORT, () => {
+            console.log(`🚀 Server listening on port ${PORT}`);
+        });
+    } catch (err) {
+        console.error('❌ Failed to start server:', err.message);
+        process.exit(1);
+    }
+}
+
+startServer();
 
 function stripLeadingZeros(val) {
     return val.replace(/^0+/, '');
