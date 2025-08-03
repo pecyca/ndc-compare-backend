@@ -1,4 +1,4 @@
-// === ✅ FULL MERGED server.js with /ndc-lookup and Comments Support ===
+// === ✅ FULL MERGED server.js with /ndc-lookup and Embedded Comments ===
 
 import express from 'express';
 import cors from 'cors';
@@ -52,7 +52,7 @@ function normalizeNdcToProductOnly(ndc) {
     return `${stripLeadingZeros(labeler)}-${stripLeadingZeros(product)}`;
 }
 
-// === 🔍 /ndc-lookup ===
+// === 🔍 /ndc-lookup with embedded comments ===
 app.get('/ndc-lookup', async (req, res) => {
     const rawNdc = req.query.ndc || '';
     const normalized = normalizeNdcToProductOnly(rawNdc);
@@ -62,9 +62,17 @@ app.get('/ndc-lookup', async (req, res) => {
     }
 
     try {
-        const row = await db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [normalized]);
-        if (!row) return res.status(404).json({ error: `NDC ${normalized} not found` });
-        res.json(row);
+        const drug = await db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [normalized]);
+        if (!drug) return res.status(404).json({ error: `NDC ${normalized} not found` });
+
+        // 🧩 Fetch embedded comments for this normalizedNDC
+        const comments = await db.all(`
+            SELECT * FROM comments
+            WHERE scope = 'ndc' AND normalizedNDC = ?
+            ORDER BY createdAt DESC
+        `, [normalized]);
+
+        res.json({ ...drug, comments });
     } catch (err) {
         console.error('❌ /ndc-lookup error:', err.message);
         res.status(500).json({ error: 'Internal error' });
@@ -193,4 +201,3 @@ app.use('/proxy/openfda', async (req, res) => {
         res.status(500).send('Proxy error');
     }
 });
-
