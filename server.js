@@ -1,4 +1,4 @@
-// === ✅ FULL MERGED server.js with /ndc-lookup and Embedded Comments ===
+// === ✅ FULL MERGED server.js with Fixed Comments Filtering ===
 
 import express from 'express';
 import cors from 'cors';
@@ -65,7 +65,6 @@ app.get('/ndc-lookup', async (req, res) => {
         const drug = await db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [normalized]);
         if (!drug) return res.status(404).json({ error: `NDC ${normalized} not found` });
 
-        // 🧩 Fetch embedded comments for this normalizedNDC
         const comments = await db.all(`
             SELECT * FROM comments
             WHERE scope = 'ndc' AND normalizedNDC = ?
@@ -122,30 +121,43 @@ function isAuthorized(req) {
     return auth === `Bearer ${INTERNAL_API_TOKEN}`;
 }
 
-// GET /comments
+// ✅ FIXED GET /comments
 app.get('/comments', async (req, res) => {
     if (!isAuthorized(req)) return res.status(403).json({ error: 'Forbidden' });
 
     const { normalizedNDC, gpiCode } = req.query;
-    if (!normalizedNDC && !gpiCode) {
-        return res.status(400).json({ error: 'Missing normalizedNDC or gpiCode' });
+
+    if (normalizedNDC) {
+        try {
+            const rows = await db.all(`
+                SELECT * FROM comments
+                WHERE scope = 'ndc' AND normalizedNDC = ?
+                ORDER BY createdAt DESC
+            `, [normalizedNDC]);
+            return res.json(rows);
+        } catch (err) {
+            console.error('❌ /comments error:', err.message);
+            return res.status(500).json({ error: 'Internal error' });
+        }
     }
 
-    try {
-        const rows = await db.all(`
-            SELECT * FROM comments
-            WHERE
-                (scope = 'ndc' AND normalizedNDC = ?)
-                OR (scope = 'gpi' AND gpiCode = ?)
-            ORDER BY createdAt DESC
-        `, [normalizedNDC || '', gpiCode || '']);
-
-        res.json({ comments: rows });
-    } catch (err) {
-        console.error('❌ /comments error:', err.message);
-        res.status(500).json({ error: 'Internal error' });
+    if (gpiCode) {
+        try {
+            const rows = await db.all(`
+                SELECT * FROM comments
+                WHERE scope = 'gpi' AND gpiCode = ?
+                ORDER BY createdAt DESC
+            `, [gpiCode]);
+            return res.json(rows);
+        } catch (err) {
+            console.error('❌ /comments error:', err.message);
+            return res.status(500).json({ error: 'Internal error' });
+        }
     }
+
+    return res.status(400).json({ error: 'Missing normalizedNDC or gpiCode' });
 });
+
 
 // POST /comments
 app.post('/comments', async (req, res) => {
