@@ -16,7 +16,7 @@ app.use(express.json());
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const dbPath = path.join(__dirname, 'merged_ndc_all_records.sqlite');
+const dbPath = '/data/merged_ndc_all_records.sqlite';
 
 let db;
 
