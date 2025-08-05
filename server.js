@@ -1,4 +1,4 @@
-// === ✅ FULL MERGED server.js with Fixed Comments Filtering ===
+// === ✅ FULL MERGED server.js with Path Fix for Persistent Disk ===
 
 import express from 'express';
 import cors from 'cors';
@@ -6,24 +6,33 @@ import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
 import path from 'path';
 import fetch from 'node-fetch';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const app = express();
-const PORT = process.env.PORT;
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const dbPath = '/data/merged_ndc_all_records.sqlite';
+
+// === 🧠 Path fallback for local vs persistent disk ===
+let dbPath = '/data/merged_ndc_all_records.sqlite';
+if (!fs.existsSync(dbPath)) {
+    dbPath = path.join(__dirname, 'merged_ndc_all_records.sqlite');
+    console.warn('⚠️ Persistent disk not found, using local DB:', dbPath);
+} else {
+    console.log('✅ Using persistent disk DB path');
+}
 
 let db;
 
 async function startServer() {
     try {
         db = await open({ filename: dbPath, driver: sqlite3.Database });
-        console.log('✅ SQLite DB connected');
+        console.log('✅ SQLite DB connected:', dbPath);
 
         app.listen(PORT, () => {
             console.log(`🚀 Server listening on port ${PORT}`);
@@ -36,12 +45,9 @@ async function startServer() {
 
 startServer();
 
+// === 🔧 Helpers ===
 function stripLeadingZeros(val) {
     return val.replace(/^0+/, '');
-}
-
-function normalizeNdcToDigitsOnly(ndc) {
-    return ndc.replace(/\D/g, '').padStart(11, '0');
 }
 
 function normalizeNdcToProductOnly(ndc) {
@@ -121,45 +127,39 @@ function isAuthorized(req) {
     return auth === `Bearer ${INTERNAL_API_TOKEN}`;
 }
 
-// ✅ FIXED GET /comments
+// ✅ GET /comments
 app.get('/comments', async (req, res) => {
     if (!isAuthorized(req)) return res.status(403).json({ error: 'Forbidden' });
 
     const { normalizedNDC, gpiCode } = req.query;
 
-    if (normalizedNDC) {
-        try {
+    try {
+        if (normalizedNDC) {
             const rows = await db.all(`
                 SELECT * FROM comments
                 WHERE scope = 'ndc' AND normalizedNDC = ?
                 ORDER BY createdAt DESC
             `, [normalizedNDC]);
             return res.json(rows);
-        } catch (err) {
-            console.error('❌ /comments error:', err.message);
-            return res.status(500).json({ error: 'Internal error' });
         }
-    }
 
-    if (gpiCode) {
-        try {
+        if (gpiCode) {
             const rows = await db.all(`
                 SELECT * FROM comments
                 WHERE scope = 'gpi' AND gpiCode = ?
                 ORDER BY createdAt DESC
             `, [gpiCode]);
             return res.json(rows);
-        } catch (err) {
-            console.error('❌ /comments error:', err.message);
-            return res.status(500).json({ error: 'Internal error' });
         }
-    }
 
-    return res.status(400).json({ error: 'Missing normalizedNDC or gpiCode' });
+        return res.status(400).json({ error: 'Missing normalizedNDC or gpiCode' });
+    } catch (err) {
+        console.error('❌ /comments error:', err.message);
+        return res.status(500).json({ error: 'Internal error' });
+    }
 });
 
-
-// POST /comments
+// ✅ POST /comments
 app.post('/comments', async (req, res) => {
     if (!isAuthorized(req)) return res.status(403).json({ error: 'Forbidden' });
 
