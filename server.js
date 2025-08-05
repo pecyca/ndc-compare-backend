@@ -67,9 +67,25 @@ app.get('/ndc-lookup', async (req, res) => {
         return res.status(400).json({ error: 'Invalid NDC format' });
     }
 
+    console.log('🧪 Raw NDC:', rawNdc);
+    console.log('🧪 Normalized:', normalized);
+
     try {
-        const drug = await db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [normalized]);
-        if (!drug) return res.status(404).json({ error: `NDC ${normalized} not found` });
+        const check = await db.get(`
+            SELECT COUNT(*) as count 
+            FROM sqlite_master 
+            WHERE type='table' AND name='ndc_data'
+        `);
+        console.log('🧠 ndc_data table exists:', check.count > 0);
+
+        const drug = await db.get(`
+            SELECT * FROM ndc_data WHERE normalizedNDC = ?
+        `, [normalized]);
+
+        if (!drug) {
+            console.warn(`🔍 No match found in ndc_data for ${normalized}`);
+            return res.status(404).json({ error: `NDC ${normalized} not found` });
+        }
 
         const comments = await db.all(`
             SELECT * FROM comments
@@ -78,6 +94,7 @@ app.get('/ndc-lookup', async (req, res) => {
         `, [normalized]);
 
         res.json({ ...drug, comments });
+
     } catch (err) {
         console.error('❌ /ndc-lookup error:', err.message);
         res.status(500).json({ error: 'Internal error' });
