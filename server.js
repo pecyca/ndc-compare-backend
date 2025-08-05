@@ -78,12 +78,12 @@ app.get('/ndc-lookup', async (req, res) => {
         `);
         console.log('🧠 ndc_data table exists:', check.count > 0);
 
-        const drug = await db.get(`
-            SELECT * FROM ndc_data WHERE normalizedNDC = ?
-        `, [normalized]);
+        const drug = await db.get(
+            `SELECT * FROM ndc_data WHERE normalizedNDC = ?`,
+            [normalized]
+        );
 
         if (!drug) {
-            console.warn(`🔍 No match found in ndc_data for ${normalized}`);
             return res.status(404).json({ error: `NDC ${normalized} not found` });
         }
 
@@ -93,7 +93,7 @@ app.get('/ndc-lookup', async (req, res) => {
             ORDER BY createdAt DESC
         `, [normalized]);
 
-        res.json({ ...drug, comments });
+        return res.json({ ...drug, comments: comments || [] });
 
     } catch (err) {
         console.error('❌ /ndc-lookup error:', err.message);
