@@ -7,7 +7,7 @@ import path from 'path';
 import fetch from 'node-fetch';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { ClerkExpressWithAuth } from '@clerk/express'; // Clerk middleware
+import ClerkExpressWithAuth from '@clerk/express'; // Clerk middleware
 
 const app = express();
 const PORT = process.env.PORT || 3000;
