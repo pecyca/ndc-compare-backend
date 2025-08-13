@@ -6,13 +6,16 @@ import path from 'path';
 import fetch from 'node-fetch';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import * as Clerk from '@clerk/express'; // ✅ Namespace import for compatibility
+import { clerkMiddleware, requireAuth, getAuth } from '@clerk/express'; // ✅ correct Clerk API
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
+
+// ✅ Attach Clerk to every request (adds req.auth and enables getAuth)
+app.use(clerkMiddleware());
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -65,13 +68,21 @@ function normalizeNdcToProductOnly(ndc) {
     return `${stripLeadingZeros(labeler)}-${stripLeadingZeros(product)}`;
 }
 
-function extractEmailFromReq(req) {
-    const claims = req.auth?.sessionClaims || {};
+// Pull email/name safely from Clerk auth
+function getEmailFromReq(req) {
+    const auth = getAuth(req);
+    const claims = auth?.sessionClaims || {};
     const email =
         (claims.email && String(claims.email)) ||
+        (claims.email_address && String(claims.email_address)) ||
         (claims.primary_email && String(claims.primary_email)) ||
         '';
     return email.toLowerCase();
+}
+function getNameFromReq(req) {
+    const auth = getAuth(req);
+    const claims = auth?.sessionClaims || {};
+    return String(claims.name || getEmailFromReq(req));
 }
 
 async function upsertUserOnAccess(email, displayName) {
@@ -85,13 +96,12 @@ async function upsertUserOnAccess(email, displayName) {
 }
 
 function requireExactCareDomain(req, res, next) {
-    const email = extractEmailFromReq(req);
+    const email = getEmailFromReq(req);
     if (!email.endsWith('@exactcarepharmacy.com')) {
         return res.status(403).json({ error: 'Unauthorized domain' });
     }
     req.userEmail = email;
-    const claims = req.auth?.sessionClaims || {};
-    req.userName = String(claims.name || email);
+    req.userName = getNameFromReq(req);
     next();
 }
 
@@ -108,12 +118,8 @@ async function requireApprovedCommenter(req, res, next) {
     }
 }
 
-// === Clerk Middleware Instances ===
-const withAuthOptional = Clerk.ClerkExpressWithAuth();
-const requireAuth = Clerk.ClerkExpressWithAuth();
-
-// === Public drug data, comments only if authed + domain OK ===
-app.get('/ndc-lookup', withAuthOptional, async (req, res) => {
+// === Public drug data, comments included only if authed + domain OK ===
+app.get('/ndc-lookup', async (req, res) => {
     const rawNdc = req.query.ndc || '';
     const normalized = normalizeNdcToProductOnly(rawNdc);
 
@@ -128,7 +134,8 @@ app.get('/ndc-lookup', withAuthOptional, async (req, res) => {
         );
         if (!drug) return res.status(404).json({ error: `NDC ${normalized} not found` });
 
-        const email = extractEmailFromReq(req);
+        // Check if caller is signed in + domain OK (auth is optional here)
+        const email = getEmailFromReq(req);
         const canSeeComments = email.endsWith('@exactcarepharmacy.com');
 
         let payload = { ...drug };
@@ -188,7 +195,8 @@ app.get('/search-ndc', async (req, res) => {
 });
 
 // === Authenticated routes ===
-app.get('/me', requireAuth, requireExactCareDomain, async (req, res) => {
+// requireAuth() ensures signed-in; then domain gate
+app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
     try {
         const row = await upsertUserOnAccess(req.userEmail, req.userName);
         res.json({
@@ -202,7 +210,7 @@ app.get('/me', requireAuth, requireExactCareDomain, async (req, res) => {
     }
 });
 
-app.get('/comments', requireAuth, requireExactCareDomain, async (req, res) => {
+app.get('/comments', requireAuth(), requireExactCareDomain, async (req, res) => {
     const { normalizedNDC, gpiCode } = req.query;
 
     try {
@@ -229,7 +237,7 @@ app.get('/comments', requireAuth, requireExactCareDomain, async (req, res) => {
     }
 });
 
-app.post('/comments', requireAuth, requireExactCareDomain, requireApprovedCommenter, async (req, res) => {
+app.post('/comments', requireAuth(), requireExactCareDomain, requireApprovedCommenter, async (req, res) => {
     const { normalizedNDC, gpiCode, scope, comment, author } = req.body;
 
     if (!['ndc', 'gpi'].includes(scope)) {
