@@ -1,4 +1,3 @@
-// === ✅ server.js — Comments only visible to authenticated ExactCare users ===
 import express from 'express';
 import cors from 'cors';
 import sqlite3 from 'sqlite3';
@@ -7,7 +6,7 @@ import path from 'path';
 import fetch from 'node-fetch';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import ClerkExpressWithAuth from '@clerk/express'; // Clerk middleware
+import * as Clerk from '@clerk/express'; // ✅ Namespace import for compatibility
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,7 +17,7 @@ app.use(express.json());
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// === DB path handling (unchanged) ===
+// === DB path handling ===
 let dbPath = '/data/merged_ndc_all_records.sqlite';
 if (!fs.existsSync(dbPath)) {
     dbPath = path.join(__dirname, 'merged_ndc_all_records.sqlite');
@@ -29,13 +28,12 @@ if (!fs.existsSync(dbPath)) {
 
 let db;
 
-// Startup
+// === Startup ===
 async function startServer() {
     try {
         db = await open({ filename: dbPath, driver: sqlite3.Database });
         console.log('✅ SQLite DB connected:', dbPath);
 
-        // Users table for commenter approvals
         await db.exec(`
       CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,10 +64,6 @@ function normalizeNdcToProductOnly(ndc) {
     const [, labeler, product] = match;
     return `${stripLeadingZeros(labeler)}-${stripLeadingZeros(product)}`;
 }
-
-// Clerk helpers
-const withAuthOptional = ClerkExpressWithAuth(); // attaches req.auth if token present (doesn't force)
-const requireAuth = ClerkExpressWithAuth();      // we’ll pair with domain check to enforce
 
 function extractEmailFromReq(req) {
     const claims = req.auth?.sessionClaims || {};
@@ -114,9 +108,11 @@ async function requireApprovedCommenter(req, res, next) {
     }
 }
 
-// === Public endpoints (no comments leaked) ===
+// === Clerk Middleware Instances ===
+const withAuthOptional = Clerk.ClerkExpressWithAuth();
+const requireAuth = Clerk.ClerkExpressWithAuth();
 
-// /ndc-lookup: public drug data; comments included ONLY if caller is authed + domain OK
+// === Public drug data, comments only if authed + domain OK ===
 app.get('/ndc-lookup', withAuthOptional, async (req, res) => {
     const rawNdc = req.query.ndc || '';
     const normalized = normalizeNdcToProductOnly(rawNdc);
@@ -125,35 +121,25 @@ app.get('/ndc-lookup', withAuthOptional, async (req, res) => {
         return res.status(400).json({ error: 'Invalid NDC format' });
     }
 
-    console.log('🧪 Raw NDC:', rawNdc);
-    console.log('🧪 Normalized:', normalized);
-
     try {
-        const check = await db.get(`
-      SELECT COUNT(*) as count 
-      FROM sqlite_master 
-      WHERE type='table' AND name='ndc_data'
-    `);
-        console.log('🧠 ndc_data table exists:', check.count > 0);
-
-        const drug = await db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [normalized]);
+        const drug = await db.get(
+            `SELECT * FROM ndc_data WHERE normalizedNDC = ?`,
+            [normalized]
+        );
         if (!drug) return res.status(404).json({ error: `NDC ${normalized} not found` });
 
-        // Decide if we can include comments
         const email = extractEmailFromReq(req);
         const canSeeComments = email.endsWith('@exactcarepharmacy.com');
 
         let payload = { ...drug };
-
         if (canSeeComments) {
             const rows = await db.all(
                 `SELECT * FROM comments WHERE scope='ndc' AND normalizedNDC=? ORDER BY createdAt DESC`,
                 [normalized]
             );
-            payload = { ...payload, comments: rows || [] };
+            payload.comments = rows || [];
         } else {
-            // Ensure public callers never see comments via this route
-            payload = { ...payload, comments: [] };
+            payload.comments = [];
         }
 
         return res.json(payload);
@@ -163,7 +149,7 @@ app.get('/ndc-lookup', withAuthOptional, async (req, res) => {
     }
 });
 
-// /search-ndc: unchanged (public search)
+// === Public search ===
 app.get('/search-ndc', async (req, res) => {
     const q = (req.query.q || '').trim().toLowerCase();
     if (!q || q.length < 3) return res.status(400).json({ error: 'Query too short' });
@@ -201,9 +187,7 @@ app.get('/search-ndc', async (req, res) => {
     }
 });
 
-// === Authenticated endpoints (read/write comments) ===
-
-// Who am I? (used by frontend to know approval state)
+// === Authenticated routes ===
 app.get('/me', requireAuth, requireExactCareDomain, async (req, res) => {
     try {
         const row = await upsertUserOnAccess(req.userEmail, req.userName);
@@ -218,7 +202,6 @@ app.get('/me', requireAuth, requireExactCareDomain, async (req, res) => {
     }
 });
 
-// READ comments (auth + ExactCare only)
 app.get('/comments', requireAuth, requireExactCareDomain, async (req, res) => {
     const { normalizedNDC, gpiCode } = req.query;
 
@@ -246,7 +229,6 @@ app.get('/comments', requireAuth, requireExactCareDomain, async (req, res) => {
     }
 });
 
-// WRITE comments (auth + ExactCare + approved)
 app.post('/comments', requireAuth, requireExactCareDomain, requireApprovedCommenter, async (req, res) => {
     const { normalizedNDC, gpiCode, scope, comment, author } = req.body;
 
@@ -273,7 +255,7 @@ app.post('/comments', requireAuth, requireExactCareDomain, requireApprovedCommen
     }
 });
 
-// === Proxies (unchanged) ===
+// === Proxies ===
 app.use('/proxy/rxnav', async (req, res) => {
     const targetUrl = `https://rxnav.nlm.nih.gov/REST${req.url}`;
     try {
