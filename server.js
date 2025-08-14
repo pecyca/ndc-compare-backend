@@ -10,9 +10,8 @@ import { fileURLToPath } from 'url';
 import {
     initSqliteBackup,
     buildSuggestIndex,
-    // (you'll use these later for routes)
-    // querySuggestRAM,
-    // getNdcWithAssist,
+    querySuggestRAM,
+    getNdcWithAssist,
 } from './sqlite-backup.js';
 import { clerkMiddleware, requireAuth, getAuth } from '@clerk/express';
 
@@ -96,6 +95,24 @@ function normalizeNdcToProductOnly(ndc) {
     const [, labeler, product] = m;
     return `${stripLeadingZeros(labeler)}-${stripLeadingZeros(product)}`;
 }
+// Maps a backup row (from sqlite-backup) into your ndc_data shape
+function mapBackupToPrimaryShape(b) {
+    return {
+        normalizedNDC: b.normalizedLP,
+        ndc: b.ndc10,
+        brandName: b.proprietaryName || null,
+        genericName: b.nonProprietaryName || null,
+        substanceName: b.substanceName || null,
+        strength: b.strengthText || null,
+        dosageForm: b.dosageForm || null,
+        routeName: b.routeName || null,
+        deaClass: b.deaClass ?? null,
+        gpiNDC: null,
+        gpi: b.gpi ?? null,
+        rxcui: b.rxcui ?? null,
+        _source: b._source, // "sqlite-backup"
+    };
+}
 
 // Pull email/name from Clerk claims safely
 function getEmailFromReq(req) {
@@ -156,14 +173,21 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
         return res.status(400).json({ error: 'Invalid NDC format' });
     }
 
+    // primary read (unchanged)
+    const primaryDbGetNdcRow = async (lp) =>
+        db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [lp]);
+
     try {
-        const drug = await db.get(
-            `SELECT * FROM ndc_data WHERE normalizedNDC = ?`,
-            [normalized]
-        );
+        let drug = await getNdcWithAssist(normalized, primaryDbGetNdcRow, { deadlineMs: 200 });
+
         if (!drug) return res.status(404).json({ error: `NDC ${normalized} not found` });
 
-        // Include comments only if signed in AND on EC domain
+        // If served from backup, map to your primary row shape so UI stays happy
+        if (drug && drug._source === 'sqlite-backup') {
+            drug = mapBackupToPrimaryShape(drug);
+        }
+
+        // Comments visibility unchanged
         const email = getEmailFromReq(req);
         const canSeeComments = email.endsWith('@exactcarepharmacy.com');
 
@@ -185,12 +209,26 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     }
 });
 
+
 // ---------- Public search ----------
 app.get('/search-ndc', async (req, res) => {
-    const q = (req.query.q || '').trim().toLowerCase();
-    if (!q || q.length < 3) return res.status(400).json({ error: 'Query too short' });
+    const q = (req.query.q || '').trim();
+    if (!q || q.length < 2) return res.status(400).json({ error: 'Query too short' });
 
-    const likeRaw = `%${q}%`;
+    // Fast path: RAM-only suggestions
+    const ram = querySuggestRAM(q, { limit: 12 });
+    if (ram.length > 0) {
+        const results = ram.map(r => ({
+            ndc: r.ndc10,
+            brandName: r.brand,
+            genericName: r.generic,
+            strength: null, // not in view; you can enrich later if needed
+        }));
+        return res.json({ results, _source: 'ram' });
+    }
+
+    // Fallback to your existing DB search (unchanged)
+    const likeRaw = `%${q.toLowerCase()}%`;
     const digitsOnly = q.replace(/\D/g, '');
     const likeDigits = `%${digitsOnly}%`;
 
@@ -216,12 +254,13 @@ app.get('/search-ndc', async (req, res) => {
             strength: row.strength,
         }));
 
-        res.json({ results });
+        res.json({ results, _source: 'primary-db' });
     } catch (err) {
         console.error('❌ /search-ndc error:', err);
         res.status(500).json({ error: 'Internal error' });
     }
 });
+
 
 // ---------- Authenticated routes ----------
 app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
