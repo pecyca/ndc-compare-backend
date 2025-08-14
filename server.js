@@ -39,8 +39,6 @@ if (!fs.existsSync(dbPath)) {
 
 let db;
 
-let db;
-
 async function startServer() {
     try {
         db = await open({ filename: dbPath, driver: sqlite3.Database });
