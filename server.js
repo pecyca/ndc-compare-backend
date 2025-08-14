@@ -19,13 +19,35 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Tunables (override in Render → Environment)
-const DEADLINE_MS = Number(process.env.NDC_BACKUP_DEADLINE_MS || 200);     // assist timeout
+const DEADLINE_MS = Number(process.env.NDC_BACKUP_DEADLINE_MS || 200);     // assisted lookup timeout
 const SUGGEST_LIMIT = Number(process.env.NDC_SUGGEST_LIMIT || 250000);       // RAM index size
 
 app.use(cors());
 app.use(express.json());
 
-// Attach Clerk on every request (adds req.auth; getAuth(req) works)
+// --- admin: rebuild backup RAM index without redeploy (token-gated, pre-Clerk) ---
+const reloadHandler = async (req, res) => {
+    const expected = process.env.NDC_RELOAD_TOKEN || '';
+    const got = req.get('x-ndc-reload-token') || '';
+    if (!expected || got !== expected) {
+        return res.status(403).json({ ok: false, error: 'forbidden' });
+    }
+    try {
+        await initSqliteBackup();                 // re-open in case file was swapped
+        await buildSuggestIndex({ limit: SUGGEST_LIMIT });
+        res.json({ ok: true, size: globalThis.__NDC_SUGGEST_SIZE__ || null });
+    } catch (e) {
+        console.error('reload-ndc-backup failed', e);
+        res.status(500).json({ ok: false });
+    }
+};
+// Accept GET/POST, with/without trailing slash BEFORE Clerk:
+['get', 'post'].forEach(m => {
+    app[m]('/admin/reload-ndc-backup', reloadHandler);
+    app[m]('/admin/reload-ndc-backup/', reloadHandler);
+});
+
+// Attach Clerk after the pre-Clerk admin route
 app.use(clerkMiddleware());
 
 const __filename = fileURLToPath(import.meta.url);
@@ -74,7 +96,7 @@ async function startServer() {
     `);
 
         // === SQLite backup + suggest (ON STARTUP) ===
-        await initSqliteBackup();                 // opens /data/ndc/fdandc.sqlite (env-driven)
+        await initSqliteBackup();                         // opens /data/ndc/fdandc.sqlite (env-driven)
         await buildSuggestIndex({ limit: SUGGEST_LIMIT }); // loads v_ndc_suggest into RAM
         // ===========================================
 
@@ -87,9 +109,7 @@ async function startServer() {
 startServer();
 
 // ---------- Helpers ----------
-function stripLeadingZeros(val) {
-    return val.replace(/^0+/, '');
-}
+function stripLeadingZeros(val) { return val.replace(/^0+/, ''); }
 function normalizeNdcToProductOnly(ndc) {
     const digits = (ndc || '').replace(/\D/g, '').padStart(11, '0');
     const m = digits.match(/^(\d{5})(\d{4})(\d{2})$/);
@@ -113,7 +133,7 @@ function mapBackupToPrimaryShape(b) {
         gpiNDC: null,
         gpi: b.gpi ?? null,
         rxcui: b.rxcui ?? null,
-        _source: b._source, // "sqlite-backup"
+        _source: b._source,
     };
 }
 
@@ -171,26 +191,21 @@ async function requireApprovedCommenter(req, res, next) {
 app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     const rawNdc = req.query.ndc || '';
     const normalized = normalizeNdcToProductOnly(rawNdc);
-
     if (!normalized || !normalized.includes('-')) {
         return res.status(400).json({ error: 'Invalid NDC format' });
     }
 
-    // primary read (unchanged)
     const primaryDbGetNdcRow = async (lp) =>
         db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [lp]);
 
     try {
         let drug = await getNdcWithAssist(normalized, primaryDbGetNdcRow, { deadlineMs: DEADLINE_MS });
-
         if (!drug) return res.status(404).json({ error: `NDC ${normalized} not found` });
 
-        // If served from backup, map to your primary row shape so UI stays happy
         if (drug && drug._source === 'sqlite-backup') {
             drug = mapBackupToPrimaryShape(drug);
         }
 
-        // Include comments only if signed in AND on EC domain
         const email = getEmailFromReq(req);
         const canSeeComments = email.endsWith('@exactcarepharmacy.com');
 
@@ -224,7 +239,8 @@ app.get('/search-ndc', async (req, res) => {
             ndc: r.ndc10,
             brandName: r.brand,
             genericName: r.generic,
-            strength: null, // not in view; can be enriched later if needed
+            strength: r.strength || null,         // now populated from the view
+            // dosageForm: r.dosageForm || null,  // uncomment if you want to return it
         }));
         return res.json({ results, _source: 'ram' });
     }
@@ -263,26 +279,15 @@ app.get('/search-ndc', async (req, res) => {
     }
 });
 
-// ---------- Health & admin ----------
+// ---------- Health ----------
 app.get('/_health/ndc-backup', (_req, res) => {
     res.json({
         ok: true,
         backupPath: process.env.NDC_SQLITE_PATH || null,
         suggestLimit: SUGGEST_LIMIT,
         assistDeadlineMs: DEADLINE_MS,
+        suggestSize: globalThis.__NDC_SUGGEST_SIZE__ || null,
     });
-});
-
-// Rebuild the RAM index without redeploy (requires Clerk + EC domain)
-app.post('/admin/reload-ndc-backup', requireAuth(), requireExactCareDomain, async (_req, res) => {
-    try {
-        await initSqliteBackup();                 // re-open if file was swapped
-        await buildSuggestIndex({ limit: SUGGEST_LIMIT });
-        res.json({ ok: true });
-    } catch (e) {
-        console.error('reload-ndc-backup failed', e);
-        res.status(500).json({ ok: false });
-    }
 });
 
 // ---------- Authenticated routes ----------
@@ -377,26 +382,8 @@ app.use('/proxy/openfda', async (req, res) => {
         res.status(500).send('Proxy error');
     }
 });
-// --- admin: rebuild backup RAM index without redeploy (token-gated) ---
-app.post('/admin/reload-ndc-backup', async (req, res) => {
-    // header token gate so you can call from Render shell
-    const expected = process.env.NDC_RELOAD_TOKEN || '';
-    const got = req.get('x-ndc-reload-token') || '';
-    if (!expected || got !== expected) {
-        return res.status(403).json({ ok: false, error: 'forbidden' });
-    }
-    try {
-        await initSqliteBackup();
-        await buildSuggestIndex({ limit: Number(process.env.NDC_SUGGEST_LIMIT || 250000) });
-        res.json({ ok: true, size: globalThis.__NDC_SUGGEST_SIZE__ || null });
-    } catch (e) {
-        console.error('reload-ndc-backup failed', e);
-        res.status(500).json({ ok: false });
-    }
-});
 
-
-// ---------- (Optional) temporary debug endpoint ----------
+// (Optional) debug
 // app.get('/_debug/db', async (_req, res) => {
 //   const tables = await db.all(`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`);
 //   res.json(tables.map(t => t.name));
