@@ -71,8 +71,9 @@ async function startServer() {
     `);
 
         // === SQLite backup + suggest (ON STARTUP) ===
-        initSqliteBackup();   // reads /data/ndc/fdandc.sqlite using env vars
-        buildSuggestIndex();  // loads v_ndc_suggest into RAM for autocomplete
+        await initSqliteBackup();
+        await buildSuggestIndex();
+// loads v_ndc_suggest into RAM for autocomplete
         // ===========================================
 
         app.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
