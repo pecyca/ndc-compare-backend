@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@clerk/express": "^1.7.19",
-    "better-sqlite3": "^8.0.1",
+    "better-sqlite3": "^8.7.0",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "node-fetch": "^3.3.2",

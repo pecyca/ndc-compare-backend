@@ -7,6 +7,13 @@ import path from 'path';
 import fetch from 'node-fetch';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import {
+    initSqliteBackup,
+    buildSuggestIndex,
+    // (you'll use these later for routes)
+    // querySuggestRAM,
+    // getNdcWithAssist,
+} from './sqlite-backup.js';
 import { clerkMiddleware, requireAuth, getAuth } from '@clerk/express';
 
 const app = express();
@@ -32,13 +39,14 @@ if (!fs.existsSync(dbPath)) {
 
 let db;
 
+let db;
+
 async function startServer() {
     try {
         db = await open({ filename: dbPath, driver: sqlite3.Database });
         console.log('✅ SQLite DB connected:', dbPath);
 
         // ---- Migrations (idempotent) ----
-        // Users table for comment approvals
         await db.exec(`
       CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +57,6 @@ async function startServer() {
       );
     `);
 
-        // Comments table (ensure exists in both local/prod)
         await db.exec(`
       CREATE TABLE IF NOT EXISTS comments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,6 +72,11 @@ async function startServer() {
       CREATE INDEX IF NOT EXISTS idx_comments_scope ON comments (scope);
     `);
 
+        // === SQLite backup + suggest (ON STARTUP) ===
+        initSqliteBackup();   // reads /data/ndc/fdandc.sqlite using env vars
+        buildSuggestIndex();  // loads v_ndc_suggest into RAM for autocomplete
+        // ===========================================
+
         app.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
     } catch (err) {
         console.error('❌ Failed to start server:', err);
@@ -72,6 +84,7 @@ async function startServer() {
     }
 }
 startServer();
+
 
 // ---------- Helpers ----------
 function stripLeadingZeros(val) {
