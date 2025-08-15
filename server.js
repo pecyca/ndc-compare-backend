@@ -19,13 +19,13 @@ import { clerkMiddleware, requireAuth, getAuth } from '@clerk/express';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---- Tunables (override via Render Environment) ----
-const DEADLINE_MS = Number(process.env.NDC_BACKUP_DEADLINE_MS || 200); // for health/debug
+// ---- Tunables (env-overridable) ----
+const DEADLINE_MS = Number(process.env.NDC_BACKUP_DEADLINE_MS || 200);   // health/debug
 const SUGGEST_LIMIT = Number(process.env.NDC_SUGGEST_LIMIT || 250000);
 const MIN_DIGITS = Number(process.env.NDC_SUGGEST_MIN_DIGITS || 6);
 const ENABLE_TEXT = /^true$/i.test(process.env.NDC_SUGGEST_ENABLE_TEXT || 'false');
 const MIN_TEXT = Number(process.env.NDC_SUGGEST_MIN_TEXT || 3);
-// ---------------------------------------------------
+// -----------------------------------
 
 app.use(cors());
 app.use(express.json());
@@ -45,7 +45,7 @@ if (!fs.existsSync(dbPath)) {
 
 let db;
 
-// ---- helpers ----
+// ----------------- helpers -----------------
 const stripLeadingZeros = (v) => String(v || '').replace(/^0+/, '') || '0';
 
 function deriveLabelerProductCandidates(input) {
@@ -55,12 +55,11 @@ function deriveLabelerProductCandidates(input) {
     const out = [];
     const push = (a, b) => out.push(`${stripLeadingZeros(a)}-${stripLeadingZeros(b)}`);
 
-    // If dashed, respect hyphenation
+    // dashed: respect hyphenation
     const parts = raw.split('-');
     if (parts.length === 3 && parts.every(p => /^\d+$/.test(p))) {
         const [a, b, c] = parts;
         const la = a.length, lb = b.length, lc = c.length;
-        // Known FDA patterns
         if (
             (la === 5 && lb === 4 && lc === 2) || // 5-4-2
             (la === 4 && lb === 4 && lc === 2) || // 4-4-2
@@ -70,33 +69,33 @@ function deriveLabelerProductCandidates(input) {
             push(a, b);
             return Array.from(new Set(out));
         }
-        // Unknown dashed shape → still try first two
         push(a, b);
         return Array.from(new Set(out));
     }
 
-    // 11 contiguous → 5-4-2
-    if (digits.length === 11) {
-        push(digits.slice(0, 5), digits.slice(5, 9));
-        return Array.from(new Set(out));
-    }
-
-    // 10 contiguous → try possible 5-4 candidates
+    // contiguous forms
+    if (digits.length === 11) { push(digits.slice(0, 5), digits.slice(5, 9)); return Array.from(new Set(out)); }
     if (digits.length === 10) {
-        // 4-4-2 → 4&4
-        push(digits.slice(0, 4), digits.slice(4, 8));
-        // 5-3-2 → 5&3
-        push(digits.slice(0, 5), digits.slice(5, 8));
-        // 5-4-1 → 5&4
-        push(digits.slice(0, 5), digits.slice(5, 9));
+        push(digits.slice(0, 4), digits.slice(4, 8)); // 4-4-2 -> 4&4
+        push(digits.slice(0, 5), digits.slice(5, 8)); // 5-3-2 -> 5&3
+        push(digits.slice(0, 5), digits.slice(5, 9)); // 5-4-1 -> 5&4
         return Array.from(new Set(out));
     }
-
-    // Last resort: if ≥9 digits, guess 5-4
-    if (digits.length >= 9) {
-        push(digits.slice(0, 5), digits.slice(5, 9));
-    }
+    if (digits.length >= 9) push(digits.slice(0, 5), digits.slice(5, 9));
     return Array.from(new Set(out));
+}
+
+// Convert dashed 10-digit (one of 4-4-2 / 5-3-2 / 5-4-1) to **11-digit digits** (5-4-2)
+function to11FromDashed10(ndc10) {
+    const m = String(ndc10 || '').match(/^(\d+)-(\d+)-(\d+)$/);
+    if (!m) return null;
+    let [, a, b, c] = m; // labeler, product, package
+    if (a.length === 4 && b.length === 4 && c.length === 2) a = a.padStart(5, '0');   // 4-4-2
+    else if (a.length === 5 && b.length === 3 && c.length === 2) b = b.padStart(4, '0'); // 5-3-2
+    else if (a.length === 5 && b.length === 4 && c.length === 1) c = c.padStart(2, '0'); // 5-4-1
+    else if (a.length === 5 && b.length === 4 && c.length === 2) {/* already 11-style dashed */ }
+    else return null;
+    return `${a}${b}${c}`; // 11-digit, no dashes
 }
 
 function getEmailFromReq(req) {
@@ -120,6 +119,7 @@ function requireExactCareDomain(req, res, next) {
     req.userName = getNameFromReq(req);
     next();
 }
+// -------------------------------------------
 
 // ---- startup ----
 async function startServer() {
@@ -152,7 +152,7 @@ async function startServer() {
       CREATE INDEX IF NOT EXISTS idx_comments_scope ON comments (scope);
     `);
 
-        // Build backup RAM index
+        // Build backup RAM index for suggestions
         await initSqliteBackup();
         await buildSuggestIndex({ limit: SUGGEST_LIMIT });
 
@@ -164,55 +164,11 @@ async function startServer() {
 }
 startServer();
 
-// ---- comments helpers ----
-async function upsertUserOnAccess(email, displayName) {
-    await db.run(
-        `INSERT INTO users (email, displayName, isApprovedCommenter)
-     VALUES (?, ?, 0)
-     ON CONFLICT(email) DO NOTHING`,
-        [email, displayName]
-    );
-    return db.get('SELECT * FROM users WHERE email = ?', [email]);
-}
-async function requireApprovedCommenter(req, res, next) {
-    try {
-        const user = await upsertUserOnAccess(req.userEmail, req.userName);
-        if (!user || user.isApprovedCommenter !== 1) {
-            return res.status(403).json({ error: 'Not approved to comment' });
-        }
-        next();
-    } catch (e) {
-        console.error('❌ Approval check failed:', e);
-        res.status(500).json({ error: 'Internal error' });
-    }
-}
-
-// ---- map backup → your primary row shape ----
-function mapBackupToPrimaryShape(b) {
-    return {
-        normalizedNDC: b.normalizedLP,
-        ndc: b.ndc10,
-        brandName: b.proprietaryName || null,
-        genericName: b.nonProprietaryName || null,
-        substanceName: b.substanceName || null,
-        strength: b.strengthText || null,
-        dosageForm: b.dosageForm || null,
-        routeName: b.routeName || null,
-        deaClass: b.deaClass ?? null,
-        gpiNDC: null,
-        gpi: b.gpi ?? null,
-        rxcui: b.rxcui ?? null,
-        _source: b._source, // "sqlite-backup"
-    };
-}
-
-// ---- Assisted lookup (accepts dashed 10/11, contiguous, etc.) ----
+// ---- Assisted lookup (accept 10/11 formats) ----
 app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     const raw = req.query.ndc || '';
     const candidates = deriveLabelerProductCandidates(raw);
-    if (!candidates.length) {
-        return res.status(400).json({ error: 'Invalid NDC format' });
-    }
+    if (!candidates.length) return res.status(400).json({ error: 'Invalid NDC format' });
 
     try {
         // Try primary DB across LP candidates
@@ -226,16 +182,16 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
         if (!drug) {
             for (const lp of candidates) {
                 const b = await getFromBackupByLabelerProduct(lp);
-                if (b) { drug = mapBackupToPrimaryShape(mapBackupRow(b, lp)); break; }
+                if (b) { drug = mapBackupRow(b, lp); break; }
             }
         }
 
-        if (!drug) return res.status(404).json({ error: `NDC not found` });
+        if (!drug) return res.status(404).json({ error: 'NDC not found' });
 
         // Include comments only if EC domain
         const email = getEmailFromReq(req);
         const canSeeComments = email.endsWith('@exactcarepharmacy.com');
-        const payload = { ...drug, comments: [] };
+        const payload = { ...drug, _source: drug._source || 'primary-db', comments: [] };
 
         if (canSeeComments) {
             payload.comments = await db.all(
@@ -253,90 +209,7 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     }
 });
 
-// ---- Primary-DB fallback helper (tolerant) ----
-async function queryPrimarySuggestSafe(db, q, digits) {
-    const likeRaw = `%${q.toLowerCase()}%`;
-    const likeDigits = `%${digits}%`;
-
-    // Attempt 1: rich (ndc + brandName + genericName + substanceName)
-    try {
-        const rows = await db.all(`
-      SELECT
-        ndc,
-        brandName,
-        genericName,
-        strength
-      FROM ndc_data
-      WHERE
-        REPLACE(REPLACE(REPLACE(COALESCE(ndc,''), '-', ''), '.', ''), ' ', '') LIKE ?
-        OR LOWER(COALESCE(brandName,  '')) LIKE ?
-        OR LOWER(COALESCE(genericName,'')) LIKE ?
-        OR LOWER(COALESCE(substanceName,'')) LIKE ?
-      LIMIT 12
-    `, [likeDigits, likeRaw, likeRaw, likeRaw]);
-        return rows;
-    } catch (e1) {
-        console.warn('⚠️ primary suggest rich query failed:', e1.message);
-    }
-
-    // Attempt 2: without substanceName
-    try {
-        const rows = await db.all(`
-      SELECT
-        ndc,
-        brandName,
-        genericName,
-        strength
-      FROM ndc_data
-      WHERE
-        REPLACE(REPLACE(REPLACE(COALESCE(ndc,''), '-', ''), '.', ''), ' ', '') LIKE ?
-        OR LOWER(COALESCE(brandName,  '')) LIKE ?
-        OR LOWER(COALESCE(genericName,'')) LIKE ?
-      LIMIT 12
-    `, [likeDigits, likeRaw, likeRaw]);
-        return rows;
-    } catch (e2) {
-        console.warn('⚠️ primary suggest simple(ndc) failed:', e2.message);
-    }
-
-    // Attempt 3: if 'ndc' column doesn't exist, try NDCPACKAGECODE (some schemas)
-    try {
-        const rows = await db.all(`
-      SELECT
-        NDCPACKAGECODE AS ndc,
-        brandName,
-        genericName,
-        strength
-      FROM ndc_data
-      WHERE
-        REPLACE(REPLACE(REPLACE(COALESCE(NDCPACKAGECODE,''), '-', ''), '.', ''), ' ', '') LIKE ?
-        OR LOWER(COALESCE(brandName,  '')) LIKE ?
-        OR LOWER(COALESCE(genericName,'')) LIKE ?
-      LIMIT 12
-    `, [likeDigits, likeRaw, likeRaw]);
-        return rows;
-    } catch (e3) {
-        console.warn('⚠️ primary suggest NDCPACKAGECODE failed:', e3.message);
-    }
-
-    // Attempt 4: digits-only fallback on NDCPACKAGECODE
-    try {
-        const rows = await db.all(`
-      SELECT NDCPACKAGECODE AS ndc
-      FROM ndc_data
-      WHERE REPLACE(REPLACE(REPLACE(COALESCE(NDCPACKAGECODE,''), '-', ''), '.', ''), ' ', '') LIKE ?
-      LIMIT 12
-    `, [likeDigits]);
-        return rows;
-    } catch (e4) {
-        console.warn('⚠️ primary suggest digits-only failed:', e4.message);
-    }
-
-    // Give up
-    return [];
-}
-
-// ---- Suggest API (min-digits gate, RAM first from backup, then primary DB fallback) ----
+// ---- Suggest API (min-digits gate, RAM first, DB fallback) ----
 app.get('/search-ndc', async (req, res) => {
     const q = (req.query.q || '').trim();
     const digitsOnly = q.replace(/\D/g, '');
@@ -354,12 +227,17 @@ app.get('/search-ndc', async (req, res) => {
     try {
         const ram = querySuggestRAM(q, { limit: 12 });
         if (ram.length > 0) {
-            const results = ram.map(r => ({
-                ndc: r.ndc10, // dashed
-                brandName: r.brand,
-                genericName: r.generic,
-                strength: r.strength ?? null,
-            }));
+            const results = ram.map(r => {
+                const ndc10 = r.ndc10 || null;              // dashed 10
+                const ndc11 = ndc10 ? to11FromDashed10(ndc10) : null; // 11-digit digits
+                return {
+                    ndc: ndc10,
+                    ndc11,                    // <—— add 11-digit canonical form
+                    brandName: r.brand || null,
+                    genericName: r.generic || null,
+                    strength: r.strength ?? null,
+                };
+            });
             return res.json({ results, _source: 'ram' });
         }
     } catch (err) {
@@ -367,18 +245,38 @@ app.get('/search-ndc', async (req, res) => {
         // continue to DB fallback
     }
 
-    // 2) Primary DB fallback (tolerant to schema differences)
+    // 2) Primary DB fallback (your ndc_data.ndc is dashed 10)
+    const likeRaw = `%${q.toLowerCase()}%;
+`;
+    const likeDigits = `%${digitsOnly}%`;
+
     try {
-        const rows = await queryPrimarySuggestSafe(db, q, digitsOnly);
-        const results = (rows || []).map(row => ({
-            ndc: row.ndc,
-            brandName: row.brandName,
-            genericName: row.genericName,
-            strength: row.strength,
-        }));
+        const rows = await db.all(`
+      SELECT ndc, brandName, genericName, strength
+      FROM ndc_data
+      WHERE
+        REPLACE(REPLACE(REPLACE(ndc, '-', ''), '.', ''), ' ', '') LIKE ?
+        OR LOWER(brandName)   LIKE ?
+        OR LOWER(genericName) LIKE ?
+        OR LOWER(substanceName) LIKE ?
+      LIMIT 12
+    `, [likeDigits, likeRaw, likeRaw, likeRaw]);
+
+        const results = (rows || []).map(row => {
+            const ndc10 = row.ndc || null;
+            const ndc11 = ndc10 ? to11FromDashed10(ndc10) : null;
+            return {
+                ndc: ndc10,
+                ndc11,                               // <—— add 11-digit canonical form
+                brandName: row.brandName,
+                genericName: row.genericName,
+                strength: row.strength,
+            };
+        });
+
         return res.json({ results, _source: 'primary-db' });
     } catch (err) {
-        console.error('❌ /search-ndc primary-db error (wrapper):', err);
+        console.error('❌ /search-ndc primary-db error:', err);
         return res.status(500).json({ results: [], _source: 'error', _error: String(err?.message || err) });
     }
 });
@@ -410,10 +308,17 @@ app.post('/admin/reload-ndc-backup/', async (req, res) => {
     }
 });
 
-// ---- Auth routes ----
+// ---- Auth & comments ----
 app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
     try {
-        const row = await upsertUserOnAccess(req.userEmail, req.userName);
+        // ensure user row exists
+        await db.run(
+            `INSERT INTO users (email, displayName, isApprovedCommenter)
+       VALUES (?, ?, 0)
+       ON CONFLICT(email) DO NOTHING`,
+            [req.userEmail, req.userName]
+        );
+        const row = await db.get('SELECT * FROM users WHERE email = ?', [req.userEmail]);
         res.json({
             email: req.userEmail,
             displayName: req.userName,
@@ -449,7 +354,7 @@ app.get('/comments', requireAuth(), requireExactCareDomain, async (req, res) => 
     }
 });
 
-app.post('/comments', requireAuth(), requireExactCareDomain, requireApprovedCommenter, async (req, res) => {
+app.post('/comments', requireAuth(), requireExactCareDomain, async (req, res) => {
     const { normalizedNDC, gpiCode, scope, comment } = req.body;
     if (!['ndc', 'gpi'].includes(scope)) return res.status(400).json({ error: 'Invalid scope' });
     if (!comment) return res.status(400).json({ error: 'Missing comment' });
@@ -461,7 +366,7 @@ app.post('/comments', requireAuth(), requireExactCareDomain, requireApprovedComm
         await db.run(
             `INSERT INTO comments (normalizedNDC, gpiCode, scope, comment, author)
        VALUES (?, ?, ?, ?, ?)`,
-            [finalNdc, finalGpi, scope, comment, req.userEmail]
+            [finalNdc, finalGpi, scope, comment, getEmailFromReq(req)]
         );
         res.status(201).json({ success: true });
     } catch (err) {
