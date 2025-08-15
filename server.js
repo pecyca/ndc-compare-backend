@@ -11,7 +11,6 @@ import {
     initSqliteBackup,
     buildSuggestIndex,
     querySuggestRAM,
-    getNdcWithAssist,
     getFromBackupByLabelerProduct,
     mapBackupRow,
 } from './sqlite-backup.js';
@@ -56,31 +55,33 @@ function deriveLabelerProductCandidates(input) {
     const out = [];
     const push = (a, b) => out.push(`${stripLeadingZeros(a)}-${stripLeadingZeros(b)}`);
 
-    // If dashed, respect the hyphenation
+    // If dashed, respect hyphenation
     const parts = raw.split('-');
     if (parts.length === 3 && parts.every(p => /^\d+$/.test(p))) {
         const [a, b, c] = parts;
         const la = a.length, lb = b.length, lc = c.length;
         // Known FDA 10/11-digit patterns
-        if ((la === 5 && lb === 4 && lc === 2) || // 5-4-2
+        if (
+            (la === 5 && lb === 4 && lc === 2) || // 5-4-2
             (la === 4 && lb === 4 && lc === 2) || // 4-4-2
             (la === 5 && lb === 3 && lc === 2) || // 5-3-2
-            (la === 5 && lb === 4 && lc === 1)) { // 5-4-1
+            (la === 5 && lb === 4 && lc === 1)    // 5-4-1
+        ) {
             push(a, b);
             return Array.from(new Set(out));
         }
-        // Unknown dashed shape: still try first two parts
+        // Unknown dashed shape → still try first two parts
         push(a, b);
         return Array.from(new Set(out));
     }
 
-    // 11-digit contiguous → 5-4-2
+    // 11 contiguous → 5-4-2
     if (digits.length === 11) {
         push(digits.slice(0, 5), digits.slice(5, 9));
         return Array.from(new Set(out));
     }
 
-    // 10-digit contiguous → try all 3 possible splits
+    // 10 contiguous → try all 3 possible splits (only need labeler+product)
     if (digits.length === 10) {
         // 4-4-2 → 4&4
         push(digits.slice(0, 4), digits.slice(4, 8));
@@ -91,7 +92,7 @@ function deriveLabelerProductCandidates(input) {
         return Array.from(new Set(out));
     }
 
-    // As a last resort, if we have ≥9 digits, guess 5-4
+    // Last resort: if we have ≥9 digits, guess 5-4
     if (digits.length >= 9) {
         push(digits.slice(0, 5), digits.slice(5, 9));
     }
@@ -205,7 +206,7 @@ function mapBackupToPrimaryShape(b) {
     };
 }
 
-// ---- Assisted lookup that accepts 10- or 11-digit, dashed or not ----
+// ---- Assisted lookup (accepts dashed 10/11, contiguous, etc.) ----
 app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     const raw = req.query.ndc || '';
     const candidates = deriveLabelerProductCandidates(raw);
@@ -214,7 +215,7 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     }
 
     try {
-        // Try primary DB (fast) across all LP candidates
+        // Try primary DB across LP candidates
         let drug = null;
         for (const lp of candidates) {
             const row = await db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [lp]);
@@ -238,7 +239,8 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
 
         if (canSeeComments) {
             payload.comments = await db.all(
-                `SELECT * FROM comments WHERE scope='ndc' AND normalizedNDC IN (${candidates.map(() => '?').join(',')})
+                `SELECT * FROM comments
+         WHERE scope='ndc' AND normalizedNDC IN (${candidates.map(() => '?').join(',')})
          ORDER BY createdAt DESC`,
                 candidates
             ) || [];
@@ -251,7 +253,7 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     }
 });
 
-// ---- Suggest API (min-digits gate, RAM first, DB fallback) ----
+// ---- Suggest API (min-digits gate, RAM first, safe DB fallback) ----
 app.get('/search-ndc', async (req, res) => {
     const q = (req.query.q || '').trim();
     const digitsOnly = q.replace(/\D/g, '');
@@ -277,31 +279,50 @@ app.get('/search-ndc', async (req, res) => {
         return res.json({ results, _source: 'ram' });
     }
 
-    // Primary DB fallback
+    // Primary DB fallback (safe)
     const likeRaw = `%${q.toLowerCase()}%`;
     const likeDigits = `%${digitsOnly}%`;
+
+    const mapRows = (rows) => rows.map(row => ({
+        ndc: row.ndc,
+        brandName: row.brandName,
+        genericName: row.genericName,
+        strength: row.strength,
+    }));
+
     try {
+        // Attempt with substanceName filter (if the column exists)
         const rows = await db.all(`
       SELECT ndc, gpiNDC, brandName, genericName, strength
       FROM ndc_data
       WHERE
-        REPLACE(REPLACE(REPLACE(gpiNDC, '-', ''), '.', ''), ' ', '') LIKE ? OR
-        LOWER(brandName)  LIKE ? OR
-        LOWER(genericName) LIKE ? OR
-        LOWER(substanceName) LIKE ?
+        REPLACE(REPLACE(REPLACE(COALESCE(gpiNDC,''), '-', ''), '.', ''), ' ', '') LIKE ? OR
+        LOWER(COALESCE(brandName,''))   LIKE ? OR
+        LOWER(COALESCE(genericName,'')) LIKE ? OR
+        LOWER(COALESCE(substanceName,'')) LIKE ?
       LIMIT 12
     `, [likeDigits, likeRaw, likeRaw, likeRaw]);
 
-        const results = rows.map(row => ({
-            ndc: row.ndc,
-            brandName: row.brandName,
-            genericName: row.genericName,
-            strength: row.strength,
-        }));
-        res.json({ results, _source: 'primary-db' });
-    } catch (err) {
-        console.error('❌ /search-ndc error:', err);
-        res.status(500).json({ error: 'Internal error' });
+        return res.json({ results: mapRows(rows), _source: 'primary-db' });
+    } catch (errA) {
+        console.warn('⚠️ /search-ndc db fallback A failed, retrying w/o substanceName:', errA?.message);
+
+        try {
+            const rows2 = await db.all(`
+        SELECT ndc, gpiNDC, brandName, genericName, strength
+        FROM ndc_data
+        WHERE
+          REPLACE(REPLACE(REPLACE(COALESCE(gpiNDC,''), '-', ''), '.', ''), ' ', '') LIKE ? OR
+          LOWER(COALESCE(brandName,''))   LIKE ? OR
+          LOWER(COALESCE(genericName,'')) LIKE ?
+        LIMIT 12
+      `, [likeDigits, likeRaw, likeRaw]);
+
+            return res.json({ results: mapRows(rows2), _source: 'primary-db' });
+        } catch (errB) {
+            console.error('❌ /search-ndc db fallback B failed:', errB);
+            return res.json({ results: [], _source: 'error', _error: String(errB?.message || errB) });
+        }
     }
 });
 
@@ -332,7 +353,7 @@ app.post('/admin/reload-ndc-backup/', async (req, res) => {
     }
 });
 
-// ---- Auth routes (unchanged) ----
+// ---- Auth routes ----
 app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
     try {
         const row = await upsertUserOnAccess(req.userEmail, req.userName);
