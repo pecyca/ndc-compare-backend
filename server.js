@@ -98,6 +98,28 @@ function to11FromDashed10(ndc10) {
     return `${a}${b}${c}`; // 11-digit, no dashes
 }
 
+function variantsForSearch(q) {
+    const s = String(q || '').trim();
+    const d = s.replace(/\D/g, '');
+    const set = new Set();
+
+    if (s) set.add(s);
+    if (d) set.add(d);
+
+    // Add LP candidates like "456-12" (derived from "00456-12", "0456-12", "456-12", 10/11 contiguous, etc.)
+    for (const lp of deriveLabelerProductCandidates(s)) {
+        set.add(lp);                  // "456-12"
+        set.add(lp.replace('-', '')); // "45612"
+    }
+
+    // Digits with one leading zero removed (handles "00456.." vs "0456..")
+    if (d.startsWith('00')) set.add(d.slice(1));
+    // Digits with all leading zeros removed
+    if (d) set.add(d.replace(/^0+/, ''));
+
+    return Array.from(set).filter(Boolean);
+}
+
 function getEmailFromReq(req) {
     const c = getAuth(req)?.sessionClaims || {};
     const email =
@@ -209,7 +231,7 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     }
 });
 
-// ---- Suggest API (min-digits gate, RAM first, DB fallback) ----
+// ---- Suggest API (min-digits gate, RAM first, DB fallback with variants) ----
 app.get('/search-ndc', async (req, res) => {
     const q = (req.query.q || '').trim();
     const digitsOnly = q.replace(/\D/g, '');
@@ -223,51 +245,77 @@ app.get('/search-ndc', async (req, res) => {
         return res.json({ results: [], _skipped: true, minDigits: MIN_DIGITS });
     }
 
-    // 1) RAM (fdandc.sqlite → merged_ndc_data → NDCPACKAGECODE)
+    const variants = variantsForSearch(q);
+
+    // 1) RAM (fdandc.sqlite → merged_ndc_data → NDCPACKAGECODE) with variants
     try {
-        const ram = querySuggestRAM(q, { limit: 12 });
-        if (ram.length > 0) {
-            const results = ram.map(r => {
-                const ndc10 = r.ndc10 || null;              // dashed 10
-                const ndc11 = ndc10 ? to11FromDashed10(ndc10) : null; // 11-digit digits
-                return {
-                    ndc: ndc10,
-                    ndc11,                    // <—— add 11-digit canonical form
-                    brandName: r.brand || null,
-                    genericName: r.generic || null,
-                    strength: r.strength ?? null,
-                };
-            });
-            return res.json({ results, _source: 'ram' });
+        const seen = new Set();
+        const ramResults = [];
+
+        for (const v of variants) {
+            const list = querySuggestRAM(v, { limit: 12 });
+            for (const r of list) {
+                const key = r.ndc10 || `${r.lp}:${r.brand}:${r.generic}`;
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    const ndc10 = r.ndc10 || null;
+                    const ndc11 = ndc10 ? to11FromDashed10(ndc10) : null;
+                    ramResults.push({
+                        ndc: ndc10,
+                        ndc11,
+                        brandName: r.brand || null,
+                        genericName: r.generic || null,
+                        strength: r.strength ?? null,
+                    });
+                }
+            }
+            if (ramResults.length >= 12) break;
+        }
+
+        if (ramResults.length > 0) {
+            return res.json({ results: ramResults.slice(0, 12), _source: 'ram' });
         }
     } catch (err) {
         console.error('❌ /search-ndc RAM error:', err);
         // continue to DB fallback
     }
 
-    // 2) Primary DB fallback (your ndc_data.ndc is dashed 10)
-    const likeRaw = `%${q.toLowerCase()}%;
-`;
-    const likeDigits = `%${digitsOnly}%`;
-
+    // 2) Primary DB fallback (ndc_data.ndc is dashed 10) with digit variants
     try {
-        const rows = await db.all(`
+        const digitVariants = Array.from(
+            new Set(
+                variants
+                    .map(v => v.replace(/\D/g, ''))
+                    .filter(v => v && v.length >= 5)
+            )
+        );
+
+        const likeDigitsParts = digitVariants.map(() =>
+            `REPLACE(REPLACE(REPLACE(ndc, '-', ''), '.', ''), ' ', '') LIKE ?`
+        );
+        const likeDigitsArgs = digitVariants.map(d => `%${d}%`);
+
+        const likeRaw = `%${q.toLowerCase()}%`;
+
+        const sql = `
       SELECT ndc, brandName, genericName, strength
       FROM ndc_data
       WHERE
-        REPLACE(REPLACE(REPLACE(ndc, '-', ''), '.', ''), ' ', '') LIKE ?
+        (${likeDigitsParts.length ? likeDigitsParts.join(' OR ') : '0'})
         OR LOWER(brandName)   LIKE ?
         OR LOWER(genericName) LIKE ?
         OR LOWER(substanceName) LIKE ?
       LIMIT 12
-    `, [likeDigits, likeRaw, likeRaw, likeRaw]);
+    `;
+
+        const rows = await db.all(sql, [...likeDigitsArgs, likeRaw, likeRaw, likeRaw]);
 
         const results = (rows || []).map(row => {
             const ndc10 = row.ndc || null;
             const ndc11 = ndc10 ? to11FromDashed10(ndc10) : null;
             return {
                 ndc: ndc10,
-                ndc11,                               // <—— add 11-digit canonical form
+                ndc11,
                 brandName: row.brandName,
                 genericName: row.genericName,
                 strength: row.strength,
