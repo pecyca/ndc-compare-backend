@@ -20,10 +20,11 @@ const PORT = process.env.PORT || 3000;
 
 // ---- Tunables (override via Render Environment) ----
 const DEADLINE_MS = Number(process.env.NDC_BACKUP_DEADLINE_MS || 200);     // assisted lookup timeout
-const SUGGEST_LIMIT = Number(process.env.NDC_SUGGEST_LIMIT || 250000);       // RAM index size cap
-const MIN_DIGITS = Number(process.env.NDC_SUGGEST_MIN_DIGITS || 6);       // gate suggestions until ≥ this many digits
+const SUGGEST_LIMIT = Number(process.env.NDC_SUGGEST_LIMIT || 250000);     // RAM index size cap
+const MIN_DIGITS = Number(process.env.NDC_SUGGEST_MIN_DIGITS || 6);        // gate suggestions until ≥ this many digits
 const ENABLE_TEXT = /^true$/i.test(process.env.NDC_SUGGEST_ENABLE_TEXT || 'false');
 const MIN_TEXT = Number(process.env.NDC_SUGGEST_MIN_TEXT || 3);
+const ALLOW_DB_FALLBACK = (process.env.NDC_SUGGEST_FALLBACK_DB || '0') === '1';
 // ---------------------------------------------------
 
 app.use(cors());
@@ -44,6 +45,7 @@ if (!fs.existsSync(dbPath)) {
 
 let db;
 
+// ---- Utils ----
 function stripLeadingZeros(val) { return val.replace(/^0+/, ''); }
 function normalizeNdcToProductOnly(ndc) {
     const digits = (ndc || '').replace(/\D/g, '').padStart(11, '0');
@@ -74,7 +76,7 @@ function requireExactCareDomain(req, res, next) {
     next();
 }
 
-// Start server & run idempotent migrations
+// ---- Boot + migrations ----
 async function startServer() {
     try {
         db = await open({ filename: dbPath, driver: sqlite3.Database });
@@ -194,7 +196,7 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     }
 });
 
-// ---- Suggest API with min-digits gate ----
+// ---- Suggest API with min-digits/text gate (RAM-first, no 500s) ----
 app.get('/search-ndc', async (req, res) => {
     const q = (req.query.q || '').trim();
     const digitsOnly = q.replace(/\D/g, '');
@@ -208,43 +210,52 @@ app.get('/search-ndc', async (req, res) => {
         return res.json({ results: [], _skipped: true, minDigits: MIN_DIGITS });
     }
 
-    // Fast path: RAM index
-    const ram = querySuggestRAM(q, { limit: 12 });
-    if (ram.length > 0) {
-        const results = ram.map(r => ({
-            ndc: r.ndc10,
-            brandName: r.brand,
-            genericName: r.generic,
-            strength: r.strength ?? null,
-        }));
-        return res.json({ results, _source: 'ram' });
-    }
-
-    // Fallback to primary DB
-    const likeRaw = `%${q.toLowerCase()}%`;
-    const likeDigits = `%${digitsOnly}%`;
     try {
-        const rows = await db.all(`
-      SELECT ndc, gpiNDC, brandName, genericName, strength
+        // 1) RAM-only path (fast, no DB)
+        const ram = querySuggestRAM(q, { limit: 12 }) || [];
+        if (ram.length > 0) {
+            const results = ram.map(r => ({
+                ndc: r.ndc10,
+                brandName: r.brand,
+                genericName: r.generic,
+                strength: r.strength ?? null,
+            }));
+            return res.json({ results, _source: 'ram' });
+        }
+
+        // 2) Optional DB fallback (guarded by env)
+        if (!ALLOW_DB_FALLBACK) {
+            return res.json({ results: [], _source: 'ram', _note: 'no-ram-matches' });
+        }
+
+        const likeRaw = `%${q.toLowerCase()}%`;
+        const likeDigits = `%${digitsOnly}%`;
+
+        // Use only columns that we KNOW exist in ndc_data to avoid 500s
+        const rows = await db.all(
+            `
+      SELECT ndc, brandName, genericName, strength
       FROM ndc_data
       WHERE
-        REPLACE(REPLACE(REPLACE(gpiNDC, '-', ''), '.', ''), ' ', '') LIKE ? OR
-        LOWER(brandName)  LIKE ? OR
-        LOWER(genericName) LIKE ? OR
-        LOWER(substanceName) LIKE ?
+        REPLACE(REPLACE(REPLACE(ndc, '-', ''), '.', ''), ' ', '') LIKE ? OR
+        LOWER(brandName) LIKE ? OR
+        LOWER(genericName) LIKE ?
       LIMIT 12
-    `, [likeDigits, likeRaw, likeRaw, likeRaw]);
+      `,
+            [likeDigits, likeRaw, likeRaw]
+        );
 
-        const results = rows.map(row => ({
+        const results = (rows || []).map(row => ({
             ndc: row.ndc,
             brandName: row.brandName,
             genericName: row.genericName,
             strength: row.strength,
         }));
-        res.json({ results, _source: 'primary-db' });
+        return res.json({ results, _source: 'primary-db' });
     } catch (err) {
         console.error('❌ /search-ndc error:', err);
-        res.status(500).json({ error: 'Internal error' });
+        // Never explode the UI; return empty results on error
+        return res.status(200).json({ results: [], _source: 'error', message: 'search-failed' });
     }
 });
 
@@ -259,7 +270,7 @@ app.get('/_health/ndc-backup', (_req, res) => {
     });
 });
 
-app.post('/admin/reload-ndc-backup/', async (req, res) => {
+app.post('/admin/reload-ndc-backup', async (req, res) => {
     const expected = process.env.NDC_RELOAD_TOKEN || '';
     const got = req.get('x-ndc-reload-token') || '';
     if (!expected || got !== expected) {
@@ -275,7 +286,7 @@ app.post('/admin/reload-ndc-backup/', async (req, res) => {
     }
 });
 
-// ---- Auth routes (unchanged) ----
+// ---- Auth routes ----
 app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
     try {
         const row = await upsertUserOnAccess(req.userEmail, req.userName);
@@ -335,7 +346,7 @@ app.post('/comments', requireAuth(), requireExactCareDomain, requireApprovedComm
     }
 });
 
-// ---- Proxies (unchanged) ----
+// ---- Proxies ----
 app.use('/proxy/rxnav', async (req, res) => {
     const targetUrl = `https://rxnav.nlm.nih.gov/REST${req.url}`;
     try {
@@ -358,4 +369,9 @@ app.use('/proxy/openfda', async (req, res) => {
         console.error('❌ openFDA proxy error:', error);
         res.status(500).send('Proxy error');
     }
+});
+
+// ---- Tiny root for friendliness ----
+app.get('/', (_req, res) => {
+    res.type('text/plain').send('ndc-compare-backend: ok');
 });

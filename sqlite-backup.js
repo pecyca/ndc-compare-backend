@@ -5,6 +5,10 @@ import sqlite3 from 'sqlite3';
 let backupDb = null;
 let suggestIndex = [];
 
+// optional: allow trimming columns to save RAM
+const INCLUDE_SUBSTANCE = !/^false$/i.test(process.env.NDC_SUGGEST_INCLUDE_SUBSTANCE || 'true');
+const INCLUDE_STRENGTH = !/^false$/i.test(process.env.NDC_SUGGEST_INCLUDE_STRENGTH || 'true');
+
 const ident = (s) => {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(s)) throw new Error('Bad ident ' + s);
     return s;
@@ -18,7 +22,11 @@ export async function initSqliteBackup() {
         return;
     }
     backupDb = await open({ filename: path, driver: sqlite3.Database });
-    await backupDb.get(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table);
+    // sanity: ensure main table exists (don’t throw; just warn if not)
+    const t = await backupDb.get(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table);
+    if (!t) {
+        console.warn(`[sqlite-backup] table not found: ${table} (backup available but primary table missing)`);
+    }
     console.log('[sqlite-backup] opened', path);
 }
 
@@ -26,6 +34,8 @@ export async function getFromBackupByLabelerProduct(lp) {
     if (!backupDb) return null;
     const table = ident(process.env.NDC_SQLITE_TABLE || 'merged_ndc_data');
     const col = ident(process.env.NDC_SQLITE_NDCPACKAGE_COL || 'NDCPACKAGECODE');
+
+    // Derive "labeler-product" (strip leading zeros on first two segments) from dashed 10-digit NDC
     const sql = `
     SELECT *
     FROM ${table}
@@ -35,8 +45,14 @@ export async function getFromBackupByLabelerProduct(lp) {
         instr(substr(${col}, instr(${col},'-')+1), '-') - 1
       ) AS INT)
     ) = ?
-    LIMIT 1`;
-    return backupDb.get(sql, lp);
+    LIMIT 1
+  `;
+    try {
+        return await backupDb.get(sql, lp);
+    } catch (e) {
+        console.warn('[sqlite-backup] backup lookup failed:', e?.message || e);
+        return null;
+    }
 }
 
 export function mapBackupRow(row, normalizedLP) {
@@ -55,12 +71,15 @@ export function mapBackupRow(row, normalizedLP) {
                 ? `${row.ACTIVE_NUMERATOR_STRENGTH} ${row.ACTIVE_INGRED_UNIT}`
                 : null,
         deaClass: row.DEASCHEDULE_NUMERIC ?? row.DEASCHEDULE ?? null,
+
+        // leave these for primary resolver to enrich
         discontinuedStatus: null,
         shortageStatus: null,
         refrigerate: null,
         niosh_code: null,
         gpi: null,
         rxcui: null,
+
         _source: 'sqlite-backup',
     };
 }
@@ -80,36 +99,74 @@ export async function getNdcWithAssist(normalizedLP, primaryFn, { deadlineMs = 2
     return late || null;
 }
 
+/** Try a SELECT for v_ndc_suggest with progressively fewer columns until one works. */
+async function tryLoadSuggest(limit) {
+    if (!backupDb) return [];
+
+    const baseCols = ['lp', 'ndc10', 'brand', 'generic', 'ndc_digits'];
+    const withStrength = INCLUDE_STRENGTH ? ['strength'] : [];
+    const withSub = INCLUDE_SUBSTANCE ? ['substance'] : [];
+
+    const attempts = [
+        [...baseCols, ...withStrength, ...withSub],
+        [...baseCols, ...withStrength],     // maybe no substance
+        [...baseCols, ...withSub],          // maybe no strength
+        [...baseCols],                      // minimal
+    ];
+
+    for (const cols of attempts) {
+        const select = cols.join(', ');
+        try {
+            const rows = await backupDb.all(
+                `SELECT ${select} FROM v_ndc_suggest LIMIT ?`, limit
+            );
+            return rows.map(r => {
+                const out = {
+                    lp: String(r.lp || ''),
+                    ndc10: r.ndc10 || null,
+                    brand: r.brand || null,
+                    generic: r.generic || null,
+                    // prefer supplied digits; otherwise derive from ndc10
+                    _digits: String(r.ndc_digits || (r.ndc10 || '').replace(/\D/g, '')).toLowerCase(),
+                    _lp: String(r.lp || '').toLowerCase(),
+                    _brand: String(r.brand || '').toLowerCase(),
+                    _generic: String(r.generic || '').toLowerCase(),
+                };
+                if ('substance' in r) {
+                    out.substance = r.substance || null;
+                    out._sub = String(r.substance || '').toLowerCase();
+                }
+                if ('strength' in r) {
+                    out.strength = r.strength || null;
+                }
+                return out;
+            });
+        } catch (e) {
+            // try the next narrower select
+            continue;
+        }
+    }
+    console.warn('[sqlite-backup] could not load v_ndc_suggest (all variants failed)');
+    return [];
+}
+
 /** Build an in-memory suggest index from v_ndc_suggest (created earlier). */
 export async function buildSuggestIndex({ limit = 250000 } = {}) {
     if (!backupDb) return;
-    const INCLUDE_SUBSTANCE = !/^false$/i.test(process.env.NDC_SUGGEST_INCLUDE_SUBSTANCE || 'true');
-
-    const rows = await backupDb.all(
-        `SELECT lp, ndc10, brand, generic, ${INCLUDE_SUBSTANCE ? 'substance,' : ''} strength, ndc_digits
-     FROM v_ndc_suggest
-     LIMIT ?`,
-        limit
+    // ensure the view exists; if not, don’t throw
+    const v = await backupDb.get(
+        `SELECT name FROM sqlite_master WHERE (type='view' OR type='table') AND name='v_ndc_suggest'`
     );
+    if (!v) {
+        suggestIndex = [];
+        globalThis.__NDC_SUGGEST_SIZE__ = 0;
+        console.warn('[sqlite-backup] v_ndc_suggest not found; suggestions disabled');
+        return;
+    }
 
-    suggestIndex = rows.map(r => {
-        const base = {
-            lp: String(r.lp || ''),
-            ndc10: r.ndc10 || null,
-            brand: r.brand || null,
-            generic: r.generic || null,
-            strength: r.strength || null,
-            _lp: String(r.lp || '').toLowerCase(),
-            _digits: String(r.ndc_digits || '').toLowerCase(),
-            _brand: String(r.brand || '').toLowerCase(),
-            _generic: String(r.generic || '').toLowerCase(),
-        };
-        if (INCLUDE_SUBSTANCE) {
-            base.substance = r.substance || null;
-            base._sub = String(r.substance || '').toLowerCase();
-        }
-        return base;
-    });
+    const rows = await tryLoadSuggest(limit);
+    // lean array already, but defensively slice to limit
+    suggestIndex = rows.slice(0, limit);
 
     globalThis.__NDC_SUGGEST_SIZE__ = suggestIndex.length;
     console.log('[sqlite-backup] suggest index loaded:', suggestIndex.length);
@@ -124,10 +181,14 @@ export function querySuggestRAM(q, { limit = 20 } = {}) {
     const push = (r) => { if (out.length < limit) out.push(r); };
 
     // 1) labeler-product prefix
-    for (const r of suggestIndex) { if (r._lp.startsWith(s)) { push(r); if (out.length >= limit) break; } }
+    for (const r of suggestIndex) {
+        if (r._lp.startsWith(s)) { push(r); if (out.length >= limit) break; }
+    }
     // 2) numeric 10/11-digit prefix
     if (out.length < limit && digits) {
-        for (const r of suggestIndex) { if (r._digits.startsWith(digits)) { push(r); if (out.length >= limit) break; } }
+        for (const r of suggestIndex) {
+            if (r._digits.startsWith(digits)) { push(r); if (out.length >= limit) break; }
+        }
     }
     // 3) names contains (brand/generic/substance if present)
     if (out.length < limit) {
@@ -137,6 +198,8 @@ export function querySuggestRAM(q, { limit = 20 } = {}) {
             }
         }
     }
+
+    // lean payload
     return out.map(({ lp, ndc10, brand, generic, substance, strength }) =>
         ({ lp, ndc10, brand, generic, substance, strength })
     );
