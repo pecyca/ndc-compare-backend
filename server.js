@@ -196,9 +196,11 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     }
 });
 
-// ---- Suggest API with min-digits/text gate (RAM-first, no 500s) ----
+// ---- Suggest API with min-digits gate (fixed fallback) ----
 app.get('/search-ndc', async (req, res) => {
     const q = (req.query.q || '').trim();
+    if (!q) return res.json({ results: [], _source: 'client' });
+
     const digitsOnly = q.replace(/\D/g, '');
     const lettersOnly = q.replace(/[^a-z]/gi, '');
 
@@ -210,10 +212,10 @@ app.get('/search-ndc', async (req, res) => {
         return res.json({ results: [], _skipped: true, minDigits: MIN_DIGITS });
     }
 
+    // 1) RAM index
     try {
-        // 1) RAM-only path (fast, no DB)
         const ram = querySuggestRAM(q, { limit: 12 }) || [];
-        if (ram.length > 0) {
+        if (ram.length) {
             const results = ram.map(r => ({
                 ndc: r.ndc10,
                 brandName: r.brand,
@@ -222,42 +224,43 @@ app.get('/search-ndc', async (req, res) => {
             }));
             return res.json({ results, _source: 'ram' });
         }
+    } catch (e) {
+        console.error('ram suggest failed:', e);
+    }
 
-        // 2) Optional DB fallback (guarded by env)
-        if (!ALLOW_DB_FALLBACK) {
-            return res.json({ results: [], _source: 'ram', _note: 'no-ram-matches' });
-        }
-
+    // 2) Fallback → primary DB
+    try {
         const likeRaw = `%${q.toLowerCase()}%`;
         const likeDigits = `%${digitsOnly}%`;
 
-        // Use only columns that we KNOW exist in ndc_data to avoid 500s
         const rows = await db.all(
             `
-      SELECT ndc, brandName, genericName, strength
+      SELECT ndc, gpiNDC, brandName, genericName, strength
       FROM ndc_data
       WHERE
-        REPLACE(REPLACE(REPLACE(ndc, '-', ''), '.', ''), ' ', '') LIKE ? OR
-        LOWER(brandName) LIKE ? OR
-        LOWER(genericName) LIKE ?
+        REPLACE(REPLACE(REPLACE(gpiNDC, '-', ''), '.', ''), ' ', '') LIKE ? OR
+        LOWER(brandName)   LIKE ? OR
+        LOWER(genericName) LIKE ? OR
+        LOWER(substanceName) LIKE ?
       LIMIT 12
       `,
-            [likeDigits, likeRaw, likeRaw]
+            [likeDigits, likeRaw, likeRaw, likeRaw]
         );
 
-        const results = (rows || []).map(row => ({
+        const results = rows.map(row => ({
             ndc: row.ndc,
             brandName: row.brandName,
             genericName: row.genericName,
             strength: row.strength,
         }));
+
         return res.json({ results, _source: 'primary-db' });
     } catch (err) {
-        console.error('❌ /search-ndc error:', err);
-        // Never explode the UI; return empty results on error
-        return res.status(200).json({ results: [], _source: 'error', message: 'search-failed' });
+        console.error('❌ /search-ndc fallback error:', err);
+        return res.status(500).json({ error: 'Internal error' });
     }
 });
+
 
 // ---- Health + admin (token-gated reload) ----
 app.get('/_health/ndc-backup', (_req, res) => {
