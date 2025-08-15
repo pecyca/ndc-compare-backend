@@ -20,7 +20,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ---- Tunables (override via Render Environment) ----
-const DEADLINE_MS = Number(process.env.NDC_BACKUP_DEADLINE_MS || 200); // (kept for health/debug)
+const DEADLINE_MS = Number(process.env.NDC_BACKUP_DEADLINE_MS || 200); // for health/debug
 const SUGGEST_LIMIT = Number(process.env.NDC_SUGGEST_LIMIT || 250000);
 const MIN_DIGITS = Number(process.env.NDC_SUGGEST_MIN_DIGITS || 6);
 const ENABLE_TEXT = /^true$/i.test(process.env.NDC_SUGGEST_ENABLE_TEXT || 'false');
@@ -61,10 +61,12 @@ function deriveLabelerProductCandidates(input) {
         const [a, b, c] = parts;
         const la = a.length, lb = b.length, lc = c.length;
         // Known FDA patterns
-        if ((la === 5 && lb === 4 && lc === 2) || // 5-4-2
+        if (
+            (la === 5 && lb === 4 && lc === 2) || // 5-4-2
             (la === 4 && lb === 4 && lc === 2) || // 4-4-2
             (la === 5 && lb === 3 && lc === 2) || // 5-3-2
-            (la === 5 && lb === 4 && lc === 1)) { // 5-4-1
+            (la === 5 && lb === 4 && lc === 1)    // 5-4-1
+        ) {
             push(a, b);
             return Array.from(new Set(out));
         }
@@ -94,7 +96,6 @@ function deriveLabelerProductCandidates(input) {
     if (digits.length >= 9) {
         push(digits.slice(0, 5), digits.slice(5, 9));
     }
-
     return Array.from(new Set(out));
 }
 
@@ -239,8 +240,8 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
         if (canSeeComments) {
             payload.comments = await db.all(
                 `SELECT * FROM comments
-           WHERE scope='ndc' AND normalizedNDC IN (${candidates.map(() => '?').join(',')})
-           ORDER BY createdAt DESC`,
+         WHERE scope='ndc' AND normalizedNDC IN (${candidates.map(() => '?').join(',')})
+         ORDER BY createdAt DESC`,
                 candidates
             ) || [];
         }
@@ -251,6 +252,89 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
         res.status(500).json({ error: 'Internal error' });
     }
 });
+
+// ---- Primary-DB fallback helper (tolerant) ----
+async function queryPrimarySuggestSafe(db, q, digits) {
+    const likeRaw = `%${q.toLowerCase()}%`;
+    const likeDigits = `%${digits}%`;
+
+    // Attempt 1: rich (ndc + brandName + genericName + substanceName)
+    try {
+        const rows = await db.all(`
+      SELECT
+        ndc,
+        brandName,
+        genericName,
+        strength
+      FROM ndc_data
+      WHERE
+        REPLACE(REPLACE(REPLACE(COALESCE(ndc,''), '-', ''), '.', ''), ' ', '') LIKE ?
+        OR LOWER(COALESCE(brandName,  '')) LIKE ?
+        OR LOWER(COALESCE(genericName,'')) LIKE ?
+        OR LOWER(COALESCE(substanceName,'')) LIKE ?
+      LIMIT 12
+    `, [likeDigits, likeRaw, likeRaw, likeRaw]);
+        return rows;
+    } catch (e1) {
+        console.warn('⚠️ primary suggest rich query failed:', e1.message);
+    }
+
+    // Attempt 2: without substanceName
+    try {
+        const rows = await db.all(`
+      SELECT
+        ndc,
+        brandName,
+        genericName,
+        strength
+      FROM ndc_data
+      WHERE
+        REPLACE(REPLACE(REPLACE(COALESCE(ndc,''), '-', ''), '.', ''), ' ', '') LIKE ?
+        OR LOWER(COALESCE(brandName,  '')) LIKE ?
+        OR LOWER(COALESCE(genericName,'')) LIKE ?
+      LIMIT 12
+    `, [likeDigits, likeRaw, likeRaw]);
+        return rows;
+    } catch (e2) {
+        console.warn('⚠️ primary suggest simple(ndc) failed:', e2.message);
+    }
+
+    // Attempt 3: if 'ndc' column doesn't exist, try NDCPACKAGECODE (some schemas)
+    try {
+        const rows = await db.all(`
+      SELECT
+        NDCPACKAGECODE AS ndc,
+        brandName,
+        genericName,
+        strength
+      FROM ndc_data
+      WHERE
+        REPLACE(REPLACE(REPLACE(COALESCE(NDCPACKAGECODE,''), '-', ''), '.', ''), ' ', '') LIKE ?
+        OR LOWER(COALESCE(brandName,  '')) LIKE ?
+        OR LOWER(COALESCE(genericName,'')) LIKE ?
+      LIMIT 12
+    `, [likeDigits, likeRaw, likeRaw]);
+        return rows;
+    } catch (e3) {
+        console.warn('⚠️ primary suggest NDCPACKAGECODE failed:', e3.message);
+    }
+
+    // Attempt 4: digits-only fallback on NDCPACKAGECODE
+    try {
+        const rows = await db.all(`
+      SELECT NDCPACKAGECODE AS ndc
+      FROM ndc_data
+      WHERE REPLACE(REPLACE(REPLACE(COALESCE(NDCPACKAGECODE,''), '-', ''), '.', ''), ' ', '') LIKE ?
+      LIMIT 12
+    `, [likeDigits]);
+        return rows;
+    } catch (e4) {
+        console.warn('⚠️ primary suggest digits-only failed:', e4.message);
+    }
+
+    // Give up
+    return [];
+}
 
 // ---- Suggest API (min-digits gate, RAM first from backup, then primary DB fallback) ----
 app.get('/search-ndc', async (req, res) => {
@@ -271,7 +355,7 @@ app.get('/search-ndc', async (req, res) => {
         const ram = querySuggestRAM(q, { limit: 12 });
         if (ram.length > 0) {
             const results = ram.map(r => ({
-                ndc: r.ndc10,          // dashed
+                ndc: r.ndc10, // dashed
                 brandName: r.brand,
                 genericName: r.generic,
                 strength: r.strength ?? null,
@@ -283,36 +367,18 @@ app.get('/search-ndc', async (req, res) => {
         // continue to DB fallback
     }
 
-    // 2) Primary DB fallback (ndc_data with `ndc` column)
-    const likeRaw = `%${q.toLowerCase()}%`;
-    const likeDigits = `%${digitsOnly}%`;
-
+    // 2) Primary DB fallback (tolerant to schema differences)
     try {
-        const rows = await db.all(`
-      SELECT
-        ndc,                -- dashed 10-digit in your primary table
-        brandName,
-        genericName,
-        strength
-      FROM ndc_data
-      WHERE
-        REPLACE(REPLACE(REPLACE(ndc, '-', ''), '.', ''), ' ', '') LIKE ?
-        OR LOWER(brandName)   LIKE ?
-        OR LOWER(genericName) LIKE ?
-        OR LOWER(substanceName) LIKE ?
-      LIMIT 12
-    `, [likeDigits, likeRaw, likeRaw, likeRaw]);
-
+        const rows = await queryPrimarySuggestSafe(db, q, digitsOnly);
         const results = (rows || []).map(row => ({
             ndc: row.ndc,
             brandName: row.brandName,
             genericName: row.genericName,
             strength: row.strength,
         }));
-
         return res.json({ results, _source: 'primary-db' });
     } catch (err) {
-        console.error('❌ /search-ndc primary-db error:', err);
+        console.error('❌ /search-ndc primary-db error (wrapper):', err);
         return res.status(500).json({ results: [], _source: 'error', _error: String(err?.message || err) });
     }
 });
