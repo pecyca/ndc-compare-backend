@@ -253,7 +253,7 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     }
 });
 
-// ---- Suggest API (min-digits gate, RAM first, safe DB fallback) ----
+// ---- Suggest API (min-digits gate, RAM first, DB fallback) ----
 app.get('/search-ndc', async (req, res) => {
     const q = (req.query.q || '').trim();
     const digitsOnly = q.replace(/\D/g, '');
@@ -279,52 +279,40 @@ app.get('/search-ndc', async (req, res) => {
         return res.json({ results, _source: 'ram' });
     }
 
-    // Primary DB fallback (safe)
+    // Primary DB fallback (use NDCPACKAGECODE instead of non-existent "ndc")
     const likeRaw = `%${q.toLowerCase()}%`;
     const likeDigits = `%${digitsOnly}%`;
 
-    const mapRows = (rows) => rows.map(row => ({
-        ndc: row.ndc,
-        brandName: row.brandName,
-        genericName: row.genericName,
-        strength: row.strength,
-    }));
-
     try {
-        // Attempt with substanceName filter (if the column exists)
         const rows = await db.all(`
-      SELECT ndc, gpiNDC, brandName, genericName, strength
+      SELECT
+        NDCPACKAGECODE AS ndc,
+        brandName,
+        genericName,
+        strength
       FROM ndc_data
       WHERE
-        REPLACE(REPLACE(REPLACE(COALESCE(gpiNDC,''), '-', ''), '.', ''), ' ', '') LIKE ? OR
-        LOWER(COALESCE(brandName,''))   LIKE ? OR
-        LOWER(COALESCE(genericName,'')) LIKE ? OR
-        LOWER(COALESCE(substanceName,'')) LIKE ?
+        REPLACE(REPLACE(REPLACE(NDCPACKAGECODE, '-', ''), '.', ''), ' ', '') LIKE ?
+        OR LOWER(brandName)  LIKE ?
+        OR LOWER(genericName) LIKE ?
+        OR LOWER(substanceName) LIKE ?
       LIMIT 12
     `, [likeDigits, likeRaw, likeRaw, likeRaw]);
 
-        return res.json({ results: mapRows(rows), _source: 'primary-db' });
-    } catch (errA) {
-        console.warn('⚠️ /search-ndc db fallback A failed, retrying w/o substanceName:', errA?.message);
+        const results = (rows || []).map(row => ({
+            ndc: row.ndc,
+            brandName: row.brandName,
+            genericName: row.genericName,
+            strength: row.strength,
+        }));
 
-        try {
-            const rows2 = await db.all(`
-        SELECT ndc, gpiNDC, brandName, genericName, strength
-        FROM ndc_data
-        WHERE
-          REPLACE(REPLACE(REPLACE(COALESCE(gpiNDC,''), '-', ''), '.', ''), ' ', '') LIKE ? OR
-          LOWER(COALESCE(brandName,''))   LIKE ? OR
-          LOWER(COALESCE(genericName,'')) LIKE ?
-        LIMIT 12
-      `, [likeDigits, likeRaw, likeRaw]);
-
-            return res.json({ results: mapRows(rows2), _source: 'primary-db' });
-        } catch (errB) {
-            console.error('❌ /search-ndc db fallback B failed:', errB);
-            return res.json({ results: [], _source: 'error', _error: String(errB?.message || errB) });
-        }
+        return res.json({ results, _source: 'primary-db' });
+    } catch (err) {
+        console.error('❌ /search-ndc error:', err);
+        return res.status(500).json({ results: [], _source: 'error', _error: String(err) });
     }
 });
+
 
 // ---- Health + admin ----
 app.get('/_health/ndc-backup', (_req, res) => {
