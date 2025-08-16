@@ -1,4 +1,5 @@
 // server.js
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import sqlite3 from 'sqlite3';
@@ -7,6 +8,7 @@ import path from 'path';
 import fetch from 'node-fetch';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+
 import {
     initSqliteBackup,
     buildSuggestIndex,
@@ -14,27 +16,61 @@ import {
     getFromBackupByLabelerProduct,
     mapBackupRow,
 } from './sqlite-backup.js';
-import { clerkMiddleware, requireAuth, getAuth } from '@clerk/express';
+
+// Auth
+import { requireAuth } from './middleware/requireAuth.js';
+import { requirePermission } from './middleware/requirePermission.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---- Tunables (env-overridable) ----
-const DEADLINE_MS = Number(process.env.NDC_BACKUP_DEADLINE_MS || 200);   // health/debug
+/* ---------------- Security / debug headers ---------------- */
+app.disable('x-powered-by');
+app.use((req, res, next) => {
+    res.set(
+        'x-build',
+        `${process.env.RENDER_GIT_BRANCH || 'local'}-${(process.env.RENDER_GIT_COMMIT || '').slice(0, 7)}`
+    );
+    next();
+});
+
+/* ---------------- Tunables (env) ---------------- */
+const DEADLINE_MS = Number(process.env.NDC_BACKUP_DEADLINE_MS || 200);
 const SUGGEST_LIMIT = Number(process.env.NDC_SUGGEST_LIMIT || 250000);
 const MIN_DIGITS = Number(process.env.NDC_SUGGEST_MIN_DIGITS || 6);
 const ENABLE_TEXT = /^true$/i.test(process.env.NDC_SUGGEST_ENABLE_TEXT || 'false');
 const MIN_TEXT = Number(process.env.NDC_SUGGEST_MIN_TEXT || 3);
-// -----------------------------------
 
-app.use(cors());
+/* ---------------- CORS ---------------- */
+const allowedOrigins = (process.env.CORS_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
+app.use(
+    cors({
+        origin(origin, cb) {
+            if (!origin || allowedOrigins.length === 0) return cb(null, true);
+            if (allowedOrigins.includes(origin)) return cb(null, true);
+            return cb(new Error(`Not allowed by CORS: ${origin}`));
+        },
+        methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+        allowedHeaders: ['Content-Type', 'Authorization'],
+        credentials: true,
+        maxAge: 86400,
+    })
+);
+app.options('*', (_req, res) => {
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.sendStatus(204);
+});
+
 app.use(express.json());
-app.use(clerkMiddleware()); // adds req.auth / getAuth(req)
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Primary DB path (your app's main DB that has ndc_data)
+/* ---------------- DB ---------------- */
 let dbPath = '/data/merged_ndc_all_records.sqlite';
 if (!fs.existsSync(dbPath)) {
     dbPath = path.join(__dirname, 'merged_ndc_all_records.sqlite');
@@ -45,7 +81,7 @@ if (!fs.existsSync(dbPath)) {
 
 let db;
 
-// ----------------- helpers -----------------
+/* ---------------- helpers ---------------- */
 const stripLeadingZeros = (v) => String(v || '').replace(/^0+/, '') || '0';
 
 function deriveLabelerProductCandidates(input) {
@@ -55,7 +91,7 @@ function deriveLabelerProductCandidates(input) {
     const out = [];
     const push = (a, b) => out.push(`${stripLeadingZeros(a)}-${stripLeadingZeros(b)}`);
 
-    // dashed: respect hyphenation
+    // dashed
     const parts = raw.split('-');
     if (parts.length === 3 && parts.every(p => /^\d+$/.test(p))) {
         const [a, b, c] = parts;
@@ -73,64 +109,53 @@ function deriveLabelerProductCandidates(input) {
         return Array.from(new Set(out));
     }
 
-    // contiguous forms
+    // contiguous
     if (digits.length === 11) { push(digits.slice(0, 5), digits.slice(5, 9)); return Array.from(new Set(out)); }
     if (digits.length === 10) {
-        push(digits.slice(0, 4), digits.slice(4, 8)); // 4-4-2 -> 4&4
-        push(digits.slice(0, 5), digits.slice(5, 8)); // 5-3-2 -> 5&3
-        push(digits.slice(0, 5), digits.slice(5, 9)); // 5-4-1 -> 5&4
+        push(digits.slice(0, 4), digits.slice(4, 8));
+        push(digits.slice(0, 5), digits.slice(5, 8));
+        push(digits.slice(0, 5), digits.slice(5, 9));
         return Array.from(new Set(out));
     }
     if (digits.length >= 9) push(digits.slice(0, 5), digits.slice(5, 9));
     return Array.from(new Set(out));
 }
 
-// Convert dashed 10-digit (one of 4-4-2 / 5-3-2 / 5-4-1) to **11-digit digits** (5-4-2)
+// 10-digit dashed → 11-digit (no dashes)
 function to11FromDashed10(ndc10) {
     const m = String(ndc10 || '').match(/^(\d+)-(\d+)-(\d+)$/);
     if (!m) return null;
-    let [, a, b, c] = m; // labeler, product, package
-    if (a.length === 4 && b.length === 4 && c.length === 2) a = a.padStart(5, '0');   // 4-4-2
-    else if (a.length === 5 && b.length === 3 && c.length === 2) b = b.padStart(4, '0'); // 5-3-2
-    else if (a.length === 5 && b.length === 4 && c.length === 1) c = c.padStart(2, '0'); // 5-4-1
-    else if (a.length === 5 && b.length === 4 && c.length === 2) {/* already 11-style dashed */ }
-    else return null;
-    return `${a}${b}${c}`; // 11-digit, no dashes
+    let [, a, b, c] = m;
+    if (a.length === 4 && b.length === 4 && c.length === 2) a = a.padStart(5, '0');
+    else if (a.length === 5 && b.length === 3 && c.length === 2) b = b.padStart(4, '0');
+    else if (a.length === 5 && b.length === 4 && c.length === 1) c = c.padStart(2, '0');
+    else if (!(a.length === 5 && b.length === 4 && c.length === 2)) return null;
+    return `${a}${b}${c}`;
 }
 
 function variantsForSearch(q) {
     const s = String(q || '').trim();
     const d = s.replace(/\D/g, '');
     const set = new Set();
-
     if (s) set.add(s);
     if (d) set.add(d);
-
-    // Add LP candidates like "456-12" (derived from "00456-12", "0456-12", "456-12", 10/11 contiguous, etc.)
     for (const lp of deriveLabelerProductCandidates(s)) {
-        set.add(lp);                  // "456-12"
-        set.add(lp.replace('-', '')); // "45612"
+        set.add(lp);
+        set.add(lp.replace('-', ''));
     }
-
-    // Digits with one leading zero removed (handles "00456.." vs "0456..")
     if (d.startsWith('00')) set.add(d.slice(1));
-    // Digits with all leading zeros removed
     if (d) set.add(d.replace(/^0+/, ''));
-
     return Array.from(set).filter(Boolean);
 }
 
+// Auth helpers
 function getEmailFromReq(req) {
-    const c = getAuth(req)?.sessionClaims || {};
-    const email =
-        (c.email && String(c.email)) ||
-        (c.email_address && String(c.email_address)) ||
-        (c.primary_email && String(c.primary_email)) || '';
+    const email = (req.user?.email && String(req.user.email)) || '';
     return email.toLowerCase();
 }
 function getNameFromReq(req) {
-    const c = getAuth(req)?.sessionClaims || {};
-    return String(c.name || getEmailFromReq(req) || '');
+    const email = getEmailFromReq(req);
+    return String(req.user?.name || req.user?.nickname || email || '');
 }
 function requireExactCareDomain(req, res, next) {
     const email = getEmailFromReq(req);
@@ -141,9 +166,8 @@ function requireExactCareDomain(req, res, next) {
     req.userName = getNameFromReq(req);
     next();
 }
-// -------------------------------------------
 
-// ---- startup ----
+/* ---------------- startup ---------------- */
 async function startServer() {
     try {
         db = await open({ filename: dbPath, driver: sqlite3.Database });
@@ -174,11 +198,13 @@ async function startServer() {
       CREATE INDEX IF NOT EXISTS idx_comments_scope ON comments (scope);
     `);
 
-        // Build backup RAM index for suggestions
         await initSqliteBackup();
         await buildSuggestIndex({ limit: SUGGEST_LIMIT });
 
-        app.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
+        app.listen(PORT, () => {
+            console.log(`🚀 Server listening on ${PORT}`);
+            console.log('Allowed CORS origins:', allowedOrigins.length ? allowedOrigins : '(all)');
+        });
     } catch (err) {
         console.error('❌ Failed to start server:', err);
         process.exit(1);
@@ -186,21 +212,19 @@ async function startServer() {
 }
 startServer();
 
-// ---- Assisted lookup (accept 10/11 formats) ----
+/* ---------------- Assisted lookup ---------------- */
 app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     const raw = req.query.ndc || '';
     const candidates = deriveLabelerProductCandidates(raw);
     if (!candidates.length) return res.status(400).json({ error: 'Invalid NDC format' });
 
     try {
-        // Try primary DB across LP candidates
         let drug = null;
         for (const lp of candidates) {
             const row = await db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [lp]);
             if (row) { drug = row; break; }
         }
 
-        // If none, try backup (fdandc.sqlite)
         if (!drug) {
             for (const lp of candidates) {
                 const b = await getFromBackupByLabelerProduct(lp);
@@ -210,7 +234,6 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
 
         if (!drug) return res.status(404).json({ error: 'NDC not found' });
 
-        // Include comments only if EC domain
         const email = getEmailFromReq(req);
         const canSeeComments = email.endsWith('@exactcarepharmacy.com');
         const payload = { ...drug, _source: drug._source || 'primary-db', comments: [] };
@@ -231,27 +254,20 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     }
 });
 
-// ---- Suggest API (min-digits gate, RAM first, DB fallback with variants) ----
+/* ---------------- Suggest API ---------------- */
 app.get('/search-ndc', async (req, res) => {
     const q = (req.query.q || '').trim();
     const digitsOnly = q.replace(/\D/g, '');
     const lettersOnly = q.replace(/[^a-z]/gi, '');
 
-    const allow =
-        digitsOnly.length >= MIN_DIGITS ||
-        (ENABLE_TEXT && lettersOnly.length >= MIN_TEXT);
-
-    if (!allow) {
-        return res.json({ results: [], _skipped: true, minDigits: MIN_DIGITS });
-    }
+    const allow = digitsOnly.length >= MIN_DIGITS || (ENABLE_TEXT && lettersOnly.length >= MIN_TEXT);
+    if (!allow) return res.json({ results: [], _skipped: true, minDigits: MIN_DIGITS });
 
     const variants = variantsForSearch(q);
 
-    // 1) RAM (fdandc.sqlite → merged_ndc_data → NDCPACKAGECODE) with variants
     try {
         const seen = new Set();
         const ramResults = [];
-
         for (const v of variants) {
             const list = querySuggestRAM(v, { limit: 12 });
             for (const r of list) {
@@ -271,27 +287,18 @@ app.get('/search-ndc', async (req, res) => {
             }
             if (ramResults.length >= 12) break;
         }
-
-        if (ramResults.length > 0) {
-            return res.json({ results: ramResults.slice(0, 12), _source: 'ram' });
-        }
+        if (ramResults.length > 0) return res.json({ results: ramResults.slice(0, 12), _source: 'ram' });
     } catch (err) {
         console.error('❌ /search-ndc RAM error:', err);
-        // continue to DB fallback
     }
 
-    // 2) Primary DB fallback (ndc_data.ndc is dashed 10) with digit variants
     try {
         const digitVariants = Array.from(
-            new Set(
-                variants
-                    .map(v => v.replace(/\D/g, ''))
-                    .filter(v => v && v.length >= 5)
-            )
+            new Set(variants.map(v => v.replace(/\D/g, '')).filter(v => v && v.length >= 5))
         );
 
-        const likeDigitsParts = digitVariants.map(() =>
-            `REPLACE(REPLACE(REPLACE(ndc, '-', ''), '.', ''), ' ', '') LIKE ?`
+        const likeDigitsParts = digitVariants.map(
+            () => `REPLACE(REPLACE(REPLACE(ndc, '-', ''), '.', ''), ' ', '') LIKE ?`
         );
         const likeDigitsArgs = digitVariants.map(d => `%${d}%`);
 
@@ -302,24 +309,17 @@ app.get('/search-ndc', async (req, res) => {
       FROM ndc_data
       WHERE
         (${likeDigitsParts.length ? likeDigitsParts.join(' OR ') : '0'})
-        OR LOWER(brandName)   LIKE ?
-        OR LOWER(genericName) LIKE ?
-        OR LOWER(substanceName) LIKE ?
+        OR LOWER(brandName)      LIKE ?
+        OR LOWER(genericName)    LIKE ?
+        OR LOWER(substanceName)  LIKE ?
       LIMIT 12
     `;
 
         const rows = await db.all(sql, [...likeDigitsArgs, likeRaw, likeRaw, likeRaw]);
-
         const results = (rows || []).map(row => {
             const ndc10 = row.ndc || null;
             const ndc11 = ndc10 ? to11FromDashed10(ndc10) : null;
-            return {
-                ndc: ndc10,
-                ndc11,
-                brandName: row.brandName,
-                genericName: row.genericName,
-                strength: row.strength,
-            };
+            return { ndc: ndc10, ndc11, brandName: row.brandName, genericName: row.genericName, strength: row.strength };
         });
 
         return res.json({ results, _source: 'primary-db' });
@@ -329,7 +329,7 @@ app.get('/search-ndc', async (req, res) => {
     }
 });
 
-// ---- Health + admin ----
+/* ---------------- Health + admin ---------------- */
 app.get('/_health/ndc-backup', (_req, res) => {
     res.json({
         ok: true,
@@ -340,12 +340,12 @@ app.get('/_health/ndc-backup', (_req, res) => {
     });
 });
 
+app.get('/', (_req, res) => res.type('text').send('ok'));
+
 app.post('/admin/reload-ndc-backup/', async (req, res) => {
     const expected = process.env.NDC_RELOAD_TOKEN || '';
     const got = req.get('x-ndc-reload-token') || '';
-    if (!expected || got !== expected) {
-        return res.status(403).json({ ok: false, error: 'forbidden' });
-    }
+    if (!expected || got !== expected) return res.status(403).json({ ok: false, error: 'forbidden' });
     try {
         await initSqliteBackup();
         await buildSuggestIndex({ limit: SUGGEST_LIMIT });
@@ -356,21 +356,33 @@ app.post('/admin/reload-ndc-backup/', async (req, res) => {
     }
 });
 
-// ---- Auth & comments ----
+/* ---------------- Auth & comments ---------------- */
 app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
     try {
-        // ensure user row exists
         await db.run(
             `INSERT INTO users (email, displayName, isApprovedCommenter)
        VALUES (?, ?, 0)
        ON CONFLICT(email) DO NOTHING`,
             [req.userEmail, req.userName]
         );
+
         const row = await db.get('SELECT * FROM users WHERE email = ?', [req.userEmail]);
+        const perms = Array.isArray(req.user?.permissions)
+            ? req.user.permissions
+            : Array.isArray(req.user?.claims?.permissions)
+                ? req.user.claims.permissions
+                : [];
+
+        const canPostComments = perms.includes('comment:write') || row?.isApprovedCommenter === 1;
+        const canDeleteComments = perms.includes('comment:delete');
+
         res.json({
             email: req.userEmail,
             displayName: req.userName,
             isApprovedCommenter: row?.isApprovedCommenter === 1,
+            permissions: perms,
+            canPostComments,
+            canDeleteComments,
         });
     } catch (e) {
         console.error('❌ /me error:', e);
@@ -378,52 +390,52 @@ app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
     }
 });
 
-app.get('/comments', requireAuth(), requireExactCareDomain, async (req, res) => {
-    const { normalizedNDC, gpiCode } = req.query;
-    try {
-        if (normalizedNDC) {
-            const rows = await db.all(
-                `SELECT * FROM comments WHERE scope='ndc' AND normalizedNDC=? ORDER BY createdAt DESC`,
-                [normalizedNDC]
+// Create comment (RBAC OR legacy DB-approved)
+app.post(
+    '/comments',
+    requireAuth(),
+    requireExactCareDomain,
+    requirePermission('comment:write', true, db),
+    async (req, res) => {
+        const { normalizedNDC, gpiCode, scope, comment } = req.body;
+        if (!['ndc', 'gpi'].includes(scope)) return res.status(400).json({ error: 'Invalid scope' });
+        if (!comment) return res.status(400).json({ error: 'Missing comment' });
+
+        const finalNdc = scope === 'ndc' ? normalizedNDC : null;
+        const finalGpi = scope === 'gpi' ? gpiCode : null;
+
+        try {
+            await db.run(
+                `INSERT INTO comments (normalizedNDC, gpiCode, scope, comment, author)
+         VALUES (?, ?, ?, ?, ?)`,
+                [finalNdc, finalGpi, scope, comment, getEmailFromReq(req)]
             );
-            return res.json(rows);
+            res.status(201).json({ success: true });
+        } catch (err) {
+            console.error('❌ POST /comments error:', err);
+            res.status(500).json({ error: 'Internal error' });
         }
-        if (gpiCode) {
-            const rows = await db.all(
-                `SELECT * FROM comments WHERE scope='gpi' AND gpiCode=? ORDER BY createdAt DESC`,
-                [gpiCode]
-            );
-            return res.json(rows);
+    }
+);
+
+// Delete comment (RBAC only)
+app.delete(
+    '/comments/:id',
+    requireAuth(),
+    requireExactCareDomain,
+    requirePermission('comment:delete'),
+    async (req, res) => {
+        try {
+            await db.run(`DELETE FROM comments WHERE id = ?`, [req.params.id]);
+            res.json({ ok: true });
+        } catch (err) {
+            console.error('❌ DELETE /comments error:', err);
+            res.status(500).json({ error: 'Internal error' });
         }
-        res.status(400).json({ error: 'Missing normalizedNDC or gpiCode' });
-    } catch (err) {
-        console.error('❌ GET /comments error:', err);
-        res.status(500).json({ error: 'Internal error' });
     }
-});
+);
 
-app.post('/comments', requireAuth(), requireExactCareDomain, async (req, res) => {
-    const { normalizedNDC, gpiCode, scope, comment } = req.body;
-    if (!['ndc', 'gpi'].includes(scope)) return res.status(400).json({ error: 'Invalid scope' });
-    if (!comment) return res.status(400).json({ error: 'Missing comment' });
-
-    const finalNdc = scope === 'ndc' ? normalizedNDC : null;
-    const finalGpi = scope === 'gpi' ? gpiCode : null;
-
-    try {
-        await db.run(
-            `INSERT INTO comments (normalizedNDC, gpiCode, scope, comment, author)
-       VALUES (?, ?, ?, ?, ?)`,
-            [finalNdc, finalGpi, scope, comment, getEmailFromReq(req)]
-        );
-        res.status(201).json({ success: true });
-    } catch (err) {
-        console.error('❌ POST /comments error:', err);
-        res.status(500).json({ error: 'Internal error' });
-    }
-});
-
-// ---- Proxies (unchanged) ----
+/* ---------------- Proxies ---------------- */
 app.use('/proxy/rxnav', async (req, res) => {
     const targetUrl = `https://rxnav.nlm.nih.gov/REST${req.url}`;
     try {
