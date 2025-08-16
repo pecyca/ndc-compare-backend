@@ -357,6 +357,7 @@ app.post('/admin/reload-ndc-backup/', async (req, res) => {
 });
 
 /* ---------------- Auth & comments ---------------- */
+// /me returns RBAC perms + booleans (with DB fallback for write)
 app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
     try {
         await db.run(
@@ -367,6 +368,7 @@ app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
         );
 
         const row = await db.get('SELECT * FROM users WHERE email = ?', [req.userEmail]);
+
         const perms = Array.isArray(req.user?.permissions)
             ? req.user.permissions
             : Array.isArray(req.user?.claims?.permissions)
@@ -390,19 +392,44 @@ app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
     }
 });
 
-// Create comment (RBAC OR legacy DB-approved)
+// GET /comments (by normalizedNDC or gpiCode)
+app.get('/comments', requireAuth(), requireExactCareDomain, async (req, res) => {
+    const { normalizedNDC, gpiCode } = req.query;
+    try {
+        if (normalizedNDC) {
+            const rows = await db.all(
+                `SELECT * FROM comments WHERE scope='ndc' AND normalizedNDC=? ORDER BY datetime(createdAt) DESC`,
+                [normalizedNDC.trim()]
+            );
+            return res.json(rows);
+        }
+        if (gpiCode) {
+            const rows = await db.all(
+                `SELECT * FROM comments WHERE scope='gpi' AND gpiCode=? ORDER BY datetime(createdAt) DESC`,
+                [gpiCode.trim()]
+            );
+            return res.json(rows);
+        }
+        res.status(400).json({ error: 'Missing normalizedNDC or gpiCode' });
+    } catch (err) {
+        console.error('❌ GET /comments error:', err);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+// Create comment (RBAC OR DB-approved fallback)
 app.post(
     '/comments',
     requireAuth(),
     requireExactCareDomain,
     requirePermission('comment:write', true, db),
     async (req, res) => {
-        const { normalizedNDC, gpiCode, scope, comment } = req.body;
+        const { normalizedNDC, gpiCode, scope, comment } = req.body || {};
         if (!['ndc', 'gpi'].includes(scope)) return res.status(400).json({ error: 'Invalid scope' });
         if (!comment) return res.status(400).json({ error: 'Missing comment' });
 
-        const finalNdc = scope === 'ndc' ? normalizedNDC : null;
-        const finalGpi = scope === 'gpi' ? gpiCode : null;
+        const finalNdc = scope === 'ndc' ? (normalizedNDC || '').trim() : null;
+        const finalGpi = scope === 'gpi' ? (gpiCode || '').trim() : null;
 
         try {
             await db.run(
