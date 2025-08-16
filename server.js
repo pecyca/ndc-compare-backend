@@ -1,5 +1,5 @@
 // server.js
-import 'dotenv/config.js';
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import sqlite3 from 'sqlite3';
@@ -7,8 +7,6 @@ import { open } from 'sqlite';
 import path from 'path';
 import fetch from 'node-fetch';
 import fs from 'fs';
-import 'dotenv/config';
-import { requirePermission } from './middleware/requirePermission.js';
 import { fileURLToPath } from 'url';
 
 import {
@@ -21,6 +19,8 @@ import {
 
 // ✔ Auth0 (custom) middleware that verifies Bearer tokens with JOSE
 import { requireAuth } from './middleware/requireAuth.js';
+// ✔ RBAC permission checker (new)
+import { requirePermission } from './middleware/requirePermission.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -37,7 +37,7 @@ app.use((req, res, next) => {
 });
 
 /* -------------------- Tunables (env-overridable) -------------------- */
-const DEADLINE_MS = Number(process.env.NDC_BACKUP_DEADLINE_MS || 200); // health/debug
+const DEADLINE_MS = Number(process.env.NDC_BACKUP_DEADLINE_MS || 200);   // health/debug
 const SUGGEST_LIMIT = Number(process.env.NDC_SUGGEST_LIMIT || 250000);
 const MIN_DIGITS = Number(process.env.NDC_SUGGEST_MIN_DIGITS || 6);
 const ENABLE_TEXT = /^true$/i.test(process.env.NDC_SUGGEST_ENABLE_TEXT || 'false');
@@ -101,14 +101,12 @@ function deriveLabelerProductCandidates(input) {
     const parts = raw.split('-');
     if (parts.length === 3 && parts.every((p) => /^\d+$/.test(p))) {
         const [a, b, c] = parts;
-        const la = a.length,
-            lb = b.length,
-            lc = c.length;
+        const la = a.length, lb = b.length, lc = c.length;
         if (
             (la === 5 && lb === 4 && lc === 2) || // 5-4-2
             (la === 4 && lb === 4 && lc === 2) || // 4-4-2
             (la === 5 && lb === 3 && lc === 2) || // 5-3-2
-            (la === 5 && lb === 4 && lc === 1) // 5-4-1
+            (la === 5 && lb === 4 && lc === 1)    // 5-4-1
         ) {
             push(a, b);
             return Array.from(new Set(out));
@@ -118,10 +116,7 @@ function deriveLabelerProductCandidates(input) {
     }
 
     // contiguous forms
-    if (digits.length === 11) {
-        push(digits.slice(0, 5), digits.slice(5, 9));
-        return Array.from(new Set(out));
-    }
+    if (digits.length === 11) { push(digits.slice(0, 5), digits.slice(5, 9)); return Array.from(new Set(out)); }
     if (digits.length === 10) {
         push(digits.slice(0, 4), digits.slice(4, 8)); // 4-4-2 -> 4&4
         push(digits.slice(0, 5), digits.slice(5, 8)); // 5-3-2 -> 5&3
@@ -137,12 +132,11 @@ function to11FromDashed10(ndc10) {
     const m = String(ndc10 || '').match(/^(\d+)-(\d+)-(\d+)$/);
     if (!m) return null;
     let [, a, b, c] = m; // labeler, product, package
-    if (a.length === 4 && b.length === 4 && c.length === 2) a = a.padStart(5, '0'); // 4-4-2
+    if (a.length === 4 && b.length === 4 && c.length === 2) a = a.padStart(5, '0');   // 4-4-2
     else if (a.length === 5 && b.length === 3 && c.length === 2) b = b.padStart(4, '0'); // 5-3-2
     else if (a.length === 5 && b.length === 4 && c.length === 1) c = c.padStart(2, '0'); // 5-4-1
-    else if (a.length === 5 && b.length === 4 && c.length === 2) {
-        /* already 11-style dashed */
-    } else return null;
+    else if (a.length === 5 && b.length === 4 && c.length === 2) {/* already 11-style dashed */ }
+    else return null;
     return `${a}${b}${c}`; // 11-digit, no dashes
 }
 
@@ -156,7 +150,7 @@ function variantsForSearch(q) {
 
     // Add LP candidates like "456-12"
     for (const lp of deriveLabelerProductCandidates(s)) {
-        set.add(lp); // "456-12"
+        set.add(lp);                  // "456-12"
         set.add(lp.replace('-', '')); // "45612"
     }
 
@@ -245,20 +239,14 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
         let drug = null;
         for (const lp of candidates) {
             const row = await db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [lp]);
-            if (row) {
-                drug = row;
-                break;
-            }
+            if (row) { drug = row; break; }
         }
 
         // If none, try backup (fdandc.sqlite)
         if (!drug) {
             for (const lp of candidates) {
                 const b = await getFromBackupByLabelerProduct(lp);
-                if (b) {
-                    drug = mapBackupRow(b, lp);
-                    break;
-                }
+                if (b) { drug = mapBackupRow(b, lp); break; }
             }
         }
 
@@ -270,13 +258,12 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
         const payload = { ...drug, _source: drug._source || 'primary-db', comments: [] };
 
         if (canSeeComments) {
-            payload.comments =
-                (await db.all(
-                    `SELECT * FROM comments
-           WHERE scope='ndc' AND normalizedNDC IN (${candidates.map(() => '?').join(',')})
-           ORDER BY createdAt DESC`,
-                    candidates
-                )) || [];
+            payload.comments = await db.all(
+                `SELECT * FROM comments
+         WHERE scope='ndc' AND normalizedNDC IN (${candidates.map(() => '?').join(',')})
+         ORDER BY createdAt DESC`,
+                candidates
+            ) || [];
         }
 
         res.json(payload);
@@ -378,9 +365,7 @@ app.get('/search-ndc', async (req, res) => {
         return res.json({ results, _source: 'primary-db' });
     } catch (err) {
         console.error('❌ /search-ndc primary-db error:', err);
-        return res
-            .status(500)
-            .json({ results: [], _source: 'error', _error: String(err?.message || err) });
+        return res.status(500).json({ results: [], _source: 'error', _error: String(err?.message || err) });
     }
 });
 
@@ -417,6 +402,7 @@ app.post('/admin/reload-ndc-backup/', async (req, res) => {
 /* ---------------- Auth & comments ---------------- */
 app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
     try {
+        // ensure a row exists (legacy flag support)
         await db.run(
             `INSERT INTO users (email, displayName, isApprovedCommenter)
        VALUES (?, ?, 0)
@@ -426,20 +412,22 @@ app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
         const row = await db.get('SELECT * FROM users WHERE email = ?', [req.userEmail]);
 
         const perms = Array.isArray(req.user?.permissions) ? req.user.permissions : [];
-        const canWrite = perms.includes('comment:write');
-        const isApproved = canWrite || row?.isApprovedCommenter === 1;
+        const canPost = perms.includes('comment:write') || row?.isApprovedCommenter === 1;
+        const canDelete = perms.includes('comment:delete');
 
         res.json({
             email: req.userEmail,
             displayName: req.userName,
-            isApprovedCommenter: isApproved
+            isApprovedCommenter: row?.isApprovedCommenter === 1,
+            permissions: perms,
+            canPostComments: canPost,
+            canDeleteComments: canDelete,
         });
     } catch (e) {
         console.error('❌ /me error:', e);
         res.status(500).json({ error: 'Internal error' });
     }
 });
-
 
 app.get('/comments', requireAuth(), requireExactCareDomain, async (req, res) => {
     const { normalizedNDC, gpiCode } = req.query;
@@ -465,39 +453,50 @@ app.get('/comments', requireAuth(), requireExactCareDomain, async (req, res) => 
     }
 });
 
-// Create comment (must have comment:write)
-app.post('/comments', requireAuth(), requireExactCareDomain, requirePermission('comment:write'), async (req, res) => {
-    const { normalizedNDC, gpiCode, scope, comment } = req.body;
-    if (!['ndc', 'gpi'].includes(scope)) return res.status(400).json({ error: 'Invalid scope' });
-    if (!comment) return res.status(400).json({ error: 'Missing comment' });
+// Create comment (must have comment:write OR be DB-approved)
+app.post(
+    '/comments',
+    requireAuth(),
+    requireExactCareDomain,
+    requirePermission('comment:write', /*allowApprovedFallback*/ true, db),
+    async (req, res) => {
+        const { normalizedNDC, gpiCode, scope, comment } = req.body;
+        if (!['ndc', 'gpi'].includes(scope)) return res.status(400).json({ error: 'Invalid scope' });
+        if (!comment) return res.status(400).json({ error: 'Missing comment' });
 
-    const finalNdc = scope === 'ndc' ? normalizedNDC : null;
-    const finalGpi = scope === 'gpi' ? gpiCode : null;
+        const finalNdc = scope === 'ndc' ? normalizedNDC : null;
+        const finalGpi = scope === 'gpi' ? gpiCode : null;
 
-    try {
-        await db.run(
-            `INSERT INTO comments (normalizedNDC, gpiCode, scope, comment, author)
-       VALUES (?, ?, ?, ?, ?)`,
-            [finalNdc, finalGpi, scope, comment, getEmailFromReq(req)]
-        );
-        res.status(201).json({ success: true });
-    } catch (err) {
-        console.error('❌ POST /comments error:', err);
-        res.status(500).json({ error: 'Internal error' });
+        try {
+            await db.run(
+                `INSERT INTO comments (normalizedNDC, gpiCode, scope, comment, author)
+         VALUES (?, ?, ?, ?, ?)`,
+                [finalNdc, finalGpi, scope, comment, getEmailFromReq(req)]
+            );
+            res.status(201).json({ success: true });
+        } catch (err) {
+            console.error('❌ POST /comments error:', err);
+            res.status(500).json({ error: 'Internal error' });
+        }
     }
-});
+);
 
 // Delete comment (must have comment:delete)
-app.delete('/comments/:id', requireAuth(), requireExactCareDomain, requirePermission('comment:delete'), async (req, res) => {
-    try {
-        await db.run(`DELETE FROM comments WHERE id = ?`, [req.params.id]);
-        res.json({ ok: true });
-    } catch (err) {
-        console.error('❌ DELETE /comments error:', err);
-        res.status(500).json({ error: 'Internal error' });
+app.delete(
+    '/comments/:id',
+    requireAuth(),
+    requireExactCareDomain,
+    requirePermission('comment:delete'),
+    async (req, res) => {
+        try {
+            await db.run(`DELETE FROM comments WHERE id = ?`, [req.params.id]);
+            res.json({ ok: true });
+        } catch (err) {
+            console.error('❌ DELETE /comments error:', err);
+            res.status(500).json({ error: 'Internal error' });
+        }
     }
-});
-
+);
 
 /* ---------------- Proxies (unchanged) ---------------- */
 app.use('/proxy/rxnav', async (req, res) => {
