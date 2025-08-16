@@ -10,16 +10,16 @@ export function requireAuth() {
 
             const token = m[1].trim();
 
-            // Verify & get the raw JWT payload
+            // Verify & get the raw JWT payload (already normalized by verifyAuth0)
             const payload = await verifyAuth0(token);
 
-            // Normalize email & name from possible locations
-            const email =
-                (payload?.email ||
-                    payload?.["https://ndc-compare/email"] ||
-                    payload?.["https://ndc_compare/email"] || // tolerate underscore if you ever used it
-                    ""
-                ).toLowerCase();
+            // Normalize email & name from possible locations (extra tolerance)
+            const email = (
+                payload?.email ||
+                payload?.["https://ndc-compare/email"] ||
+                payload?.["https://ndc_compare/email"] ||
+                ""
+            ).toLowerCase();
 
             const name =
                 payload?.name ||
@@ -28,13 +28,16 @@ export function requireAuth() {
                 email ||
                 "";
 
+            // Pull permissions from payload (Auth0 RBAC: "Add Permissions in the Access Token")
+            const permissions = Array.isArray(payload?.permissions) ? payload.permissions : [];
+
             // What downstream code expects:
             req.user = {
                 sub: payload?.sub || "",
                 email,
                 name,
-                // keep raw if you ever need more claims:
-                claims: payload,
+                permissions,   // <-- pass-through so requirePermission & /me can read it
+                claims: payload, // keep all raw claims for debugging or edge reads
             };
 
             return next();

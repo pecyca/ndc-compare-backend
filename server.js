@@ -367,7 +367,11 @@ app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
         );
 
         const row = await db.get('SELECT * FROM users WHERE email = ?', [req.userEmail]);
-        const perms = Array.isArray(req.user?.permissions) ? req.user.permissions : [];
+        const perms = Array.isArray(req.user?.permissions)
+            ? req.user.permissions
+            : Array.isArray(req.user?.claims?.permissions)
+                ? req.user.claims.permissions
+                : [];
 
         const canPostComments = perms.includes('comment:write') || row?.isApprovedCommenter === 1;
         const canDeleteComments = perms.includes('comment:delete');
