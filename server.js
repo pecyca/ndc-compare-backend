@@ -1,4 +1,5 @@
 // server.js
+import 'dotenv/config.js';
 import express from 'express';
 import cors from 'cors';
 import sqlite3 from 'sqlite3';
@@ -7,6 +8,7 @@ import path from 'path';
 import fetch from 'node-fetch';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+
 import {
     initSqliteBackup,
     buildSuggestIndex,
@@ -14,22 +16,60 @@ import {
     getFromBackupByLabelerProduct,
     mapBackupRow,
 } from './sqlite-backup.js';
-import { clerkMiddleware, requireAuth, getAuth } from '@clerk/express';
+
+// ✔ Auth0 (custom) middleware that verifies Bearer tokens with JOSE
+import { requireAuth } from './middleware/requireAuth.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---- Tunables (env-overridable) ----
-const DEADLINE_MS = Number(process.env.NDC_BACKUP_DEADLINE_MS || 200);   // health/debug
+/* -------------------- Security / debug headers -------------------- */
+app.disable('x-powered-by'); // hide Express signature
+app.use((req, res, next) => {
+    // Helps verify which branch/commit is live on Render
+    res.set(
+        'x-build',
+        `${process.env.RENDER_GIT_BRANCH || 'local'}-${(process.env.RENDER_GIT_COMMIT || '').slice(0, 7)}`
+    );
+    next();
+});
+
+/* -------------------- Tunables (env-overridable) -------------------- */
+const DEADLINE_MS = Number(process.env.NDC_BACKUP_DEADLINE_MS || 200); // health/debug
 const SUGGEST_LIMIT = Number(process.env.NDC_SUGGEST_LIMIT || 250000);
 const MIN_DIGITS = Number(process.env.NDC_SUGGEST_MIN_DIGITS || 6);
 const ENABLE_TEXT = /^true$/i.test(process.env.NDC_SUGGEST_ENABLE_TEXT || 'false');
 const MIN_TEXT = Number(process.env.NDC_SUGGEST_MIN_TEXT || 3);
-// -----------------------------------
+/* -------------------------------------------------------------------- */
 
-app.use(cors());
+// ---- CORS (allow Authorization + configured origins) ----
+const allowedOrigins = (process.env.CORS_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+app.use(
+    cors({
+        origin(origin, cb) {
+            // allow same-origin / non-browser requests, or allow all when no env set
+            if (!origin || allowedOrigins.length === 0) return cb(null, true);
+            if (allowedOrigins.includes(origin)) return cb(null, true);
+            return cb(new Error(`Not allowed by CORS: ${origin}`));
+        },
+        methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+        allowedHeaders: ['Content-Type', 'Authorization'],
+        credentials: true,
+        maxAge: 86400,
+    })
+);
+
+// Explicit preflight helper (cors middleware already handles this, but it’s nice to be explicit)
+app.options('*', (_req, res) => {
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.sendStatus(204);
+});
+
 app.use(express.json());
-app.use(clerkMiddleware()); // adds req.auth / getAuth(req)
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -45,7 +85,7 @@ if (!fs.existsSync(dbPath)) {
 
 let db;
 
-// ----------------- helpers -----------------
+/* ----------------------------- helpers ----------------------------- */
 const stripLeadingZeros = (v) => String(v || '').replace(/^0+/, '') || '0';
 
 function deriveLabelerProductCandidates(input) {
@@ -57,14 +97,16 @@ function deriveLabelerProductCandidates(input) {
 
     // dashed: respect hyphenation
     const parts = raw.split('-');
-    if (parts.length === 3 && parts.every(p => /^\d+$/.test(p))) {
+    if (parts.length === 3 && parts.every((p) => /^\d+$/.test(p))) {
         const [a, b, c] = parts;
-        const la = a.length, lb = b.length, lc = c.length;
+        const la = a.length,
+            lb = b.length,
+            lc = c.length;
         if (
             (la === 5 && lb === 4 && lc === 2) || // 5-4-2
             (la === 4 && lb === 4 && lc === 2) || // 4-4-2
             (la === 5 && lb === 3 && lc === 2) || // 5-3-2
-            (la === 5 && lb === 4 && lc === 1)    // 5-4-1
+            (la === 5 && lb === 4 && lc === 1) // 5-4-1
         ) {
             push(a, b);
             return Array.from(new Set(out));
@@ -74,7 +116,10 @@ function deriveLabelerProductCandidates(input) {
     }
 
     // contiguous forms
-    if (digits.length === 11) { push(digits.slice(0, 5), digits.slice(5, 9)); return Array.from(new Set(out)); }
+    if (digits.length === 11) {
+        push(digits.slice(0, 5), digits.slice(5, 9));
+        return Array.from(new Set(out));
+    }
     if (digits.length === 10) {
         push(digits.slice(0, 4), digits.slice(4, 8)); // 4-4-2 -> 4&4
         push(digits.slice(0, 5), digits.slice(5, 8)); // 5-3-2 -> 5&3
@@ -85,16 +130,17 @@ function deriveLabelerProductCandidates(input) {
     return Array.from(new Set(out));
 }
 
-// Convert dashed 10-digit (one of 4-4-2 / 5-3-2 / 5-4-1) to **11-digit digits** (5-4-2)
+// Convert dashed 10-digit to **11-digit digits** (5-4-2)
 function to11FromDashed10(ndc10) {
     const m = String(ndc10 || '').match(/^(\d+)-(\d+)-(\d+)$/);
     if (!m) return null;
     let [, a, b, c] = m; // labeler, product, package
-    if (a.length === 4 && b.length === 4 && c.length === 2) a = a.padStart(5, '0');   // 4-4-2
+    if (a.length === 4 && b.length === 4 && c.length === 2) a = a.padStart(5, '0'); // 4-4-2
     else if (a.length === 5 && b.length === 3 && c.length === 2) b = b.padStart(4, '0'); // 5-3-2
     else if (a.length === 5 && b.length === 4 && c.length === 1) c = c.padStart(2, '0'); // 5-4-1
-    else if (a.length === 5 && b.length === 4 && c.length === 2) {/* already 11-style dashed */ }
-    else return null;
+    else if (a.length === 5 && b.length === 4 && c.length === 2) {
+        /* already 11-style dashed */
+    } else return null;
     return `${a}${b}${c}`; // 11-digit, no dashes
 }
 
@@ -106,31 +152,28 @@ function variantsForSearch(q) {
     if (s) set.add(s);
     if (d) set.add(d);
 
-    // Add LP candidates like "456-12" (derived from "00456-12", "0456-12", "456-12", 10/11 contiguous, etc.)
+    // Add LP candidates like "456-12"
     for (const lp of deriveLabelerProductCandidates(s)) {
-        set.add(lp);                  // "456-12"
+        set.add(lp); // "456-12"
         set.add(lp.replace('-', '')); // "45612"
     }
 
-    // Digits with one leading zero removed (handles "00456.." vs "0456..")
+    // Remove one leading zero (handles 00456 vs 0456)
     if (d.startsWith('00')) set.add(d.slice(1));
-    // Digits with all leading zeros removed
+    // Remove all leading zeros
     if (d) set.add(d.replace(/^0+/, ''));
 
     return Array.from(set).filter(Boolean);
 }
 
+// ---- Auth helpers (Auth0 payload is in req.user from requireAuth) ----
 function getEmailFromReq(req) {
-    const c = getAuth(req)?.sessionClaims || {};
-    const email =
-        (c.email && String(c.email)) ||
-        (c.email_address && String(c.email_address)) ||
-        (c.primary_email && String(c.primary_email)) || '';
+    const email = (req.user?.email && String(req.user.email)) || ''; // ensure 'email' scope in SPA
     return email.toLowerCase();
 }
 function getNameFromReq(req) {
-    const c = getAuth(req)?.sessionClaims || {};
-    return String(c.name || getEmailFromReq(req) || '');
+    const email = getEmailFromReq(req);
+    return String(req.user?.name || req.user?.nickname || email || '');
 }
 function requireExactCareDomain(req, res, next) {
     const email = getEmailFromReq(req);
@@ -141,7 +184,7 @@ function requireExactCareDomain(req, res, next) {
     req.userName = getNameFromReq(req);
     next();
 }
-// -------------------------------------------
+/* ------------------------------------------------------------------- */
 
 // ---- startup ----
 async function startServer() {
@@ -178,7 +221,10 @@ async function startServer() {
         await initSqliteBackup();
         await buildSuggestIndex({ limit: SUGGEST_LIMIT });
 
-        app.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
+        app.listen(PORT, () => {
+            console.log(`🚀 Server listening on ${PORT}`);
+            console.log('Allowed CORS origins:', allowedOrigins.length ? allowedOrigins : '(all)');
+        });
     } catch (err) {
         console.error('❌ Failed to start server:', err);
         process.exit(1);
@@ -186,7 +232,7 @@ async function startServer() {
 }
 startServer();
 
-// ---- Assisted lookup (accept 10/11 formats) ----
+/* -------------------- Assisted lookup (10/11) -------------------- */
 app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     const raw = req.query.ndc || '';
     const candidates = deriveLabelerProductCandidates(raw);
@@ -197,31 +243,38 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
         let drug = null;
         for (const lp of candidates) {
             const row = await db.get(`SELECT * FROM ndc_data WHERE normalizedNDC = ?`, [lp]);
-            if (row) { drug = row; break; }
+            if (row) {
+                drug = row;
+                break;
+            }
         }
 
         // If none, try backup (fdandc.sqlite)
         if (!drug) {
             for (const lp of candidates) {
                 const b = await getFromBackupByLabelerProduct(lp);
-                if (b) { drug = mapBackupRow(b, lp); break; }
+                if (b) {
+                    drug = mapBackupRow(b, lp);
+                    break;
+                }
             }
         }
 
         if (!drug) return res.status(404).json({ error: 'NDC not found' });
 
-        // Include comments only if EC domain
+        // Include comments only if company domain (only possible if request had a valid Auth0 token)
         const email = getEmailFromReq(req);
         const canSeeComments = email.endsWith('@exactcarepharmacy.com');
         const payload = { ...drug, _source: drug._source || 'primary-db', comments: [] };
 
         if (canSeeComments) {
-            payload.comments = await db.all(
-                `SELECT * FROM comments
-         WHERE scope='ndc' AND normalizedNDC IN (${candidates.map(() => '?').join(',')})
-         ORDER BY createdAt DESC`,
-                candidates
-            ) || [];
+            payload.comments =
+                (await db.all(
+                    `SELECT * FROM comments
+           WHERE scope='ndc' AND normalizedNDC IN (${candidates.map(() => '?').join(',')})
+           ORDER BY createdAt DESC`,
+                    candidates
+                )) || [];
         }
 
         res.json(payload);
@@ -231,15 +284,13 @@ app.get(['/ndc-lookup', '/ndc-lookup2'], async (req, res) => {
     }
 });
 
-// ---- Suggest API (min-digits gate, RAM first, DB fallback with variants) ----
+/* ---------------- Suggest API (RAM-first, DB fallback) ---------------- */
 app.get('/search-ndc', async (req, res) => {
     const q = (req.query.q || '').trim();
     const digitsOnly = q.replace(/\D/g, '');
     const lettersOnly = q.replace(/[^a-z]/gi, '');
 
-    const allow =
-        digitsOnly.length >= MIN_DIGITS ||
-        (ENABLE_TEXT && lettersOnly.length >= MIN_TEXT);
+    const allow = digitsOnly.length >= MIN_DIGITS || (ENABLE_TEXT && lettersOnly.length >= MIN_TEXT);
 
     if (!allow) {
         return res.json({ results: [], _skipped: true, minDigits: MIN_DIGITS });
@@ -247,7 +298,7 @@ app.get('/search-ndc', async (req, res) => {
 
     const variants = variantsForSearch(q);
 
-    // 1) RAM (fdandc.sqlite → merged_ndc_data → NDCPACKAGECODE) with variants
+    // 1) RAM (fdandc.sqlite → merged_ndc_data) with variants
     try {
         const seen = new Set();
         const ramResults = [];
@@ -280,20 +331,20 @@ app.get('/search-ndc', async (req, res) => {
         // continue to DB fallback
     }
 
-    // 2) Primary DB fallback (ndc_data.ndc is dashed 10) with digit variants
+    // 2) Primary DB fallback (ndc_data.ndc is dashed 10) with digit variants + text
     try {
         const digitVariants = Array.from(
             new Set(
                 variants
-                    .map(v => v.replace(/\D/g, ''))
-                    .filter(v => v && v.length >= 5)
+                    .map((v) => v.replace(/\D/g, ''))
+                    .filter((v) => v && v.length >= 5)
             )
         );
 
-        const likeDigitsParts = digitVariants.map(() =>
-            `REPLACE(REPLACE(REPLACE(ndc, '-', ''), '.', ''), ' ', '') LIKE ?`
+        const likeDigitsParts = digitVariants.map(
+            () => `REPLACE(REPLACE(REPLACE(ndc, '-', ''), '.', ''), ' ', '') LIKE ?`
         );
-        const likeDigitsArgs = digitVariants.map(d => `%${d}%`);
+        const likeDigitsArgs = digitVariants.map((d) => `%${d}%`);
 
         const likeRaw = `%${q.toLowerCase()}%`;
 
@@ -302,15 +353,15 @@ app.get('/search-ndc', async (req, res) => {
       FROM ndc_data
       WHERE
         (${likeDigitsParts.length ? likeDigitsParts.join(' OR ') : '0'})
-        OR LOWER(brandName)   LIKE ?
-        OR LOWER(genericName) LIKE ?
-        OR LOWER(substanceName) LIKE ?
+        OR LOWER(brandName)      LIKE ?
+        OR LOWER(genericName)    LIKE ?
+        OR LOWER(substanceName)  LIKE ?
       LIMIT 12
     `;
 
         const rows = await db.all(sql, [...likeDigitsArgs, likeRaw, likeRaw, likeRaw]);
 
-        const results = (rows || []).map(row => {
+        const results = (rows || []).map((row) => {
             const ndc10 = row.ndc || null;
             const ndc11 = ndc10 ? to11FromDashed10(ndc10) : null;
             return {
@@ -325,11 +376,13 @@ app.get('/search-ndc', async (req, res) => {
         return res.json({ results, _source: 'primary-db' });
     } catch (err) {
         console.error('❌ /search-ndc primary-db error:', err);
-        return res.status(500).json({ results: [], _source: 'error', _error: String(err?.message || err) });
+        return res
+            .status(500)
+            .json({ results: [], _source: 'error', _error: String(err?.message || err) });
     }
 });
 
-// ---- Health + admin ----
+/* ---------------- Health + admin ---------------- */
 app.get('/_health/ndc-backup', (_req, res) => {
     res.json({
         ok: true,
@@ -339,6 +392,9 @@ app.get('/_health/ndc-backup', (_req, res) => {
         suggestSize: globalThis.__NDC_SUGGEST_SIZE__ ?? null,
     });
 });
+
+// simple root ping
+app.get('/', (_req, res) => res.type('text').send('ok'));
 
 app.post('/admin/reload-ndc-backup/', async (req, res) => {
     const expected = process.env.NDC_RELOAD_TOKEN || '';
@@ -356,7 +412,7 @@ app.post('/admin/reload-ndc-backup/', async (req, res) => {
     }
 });
 
-// ---- Auth & comments ----
+/* ---------------- Auth & comments ---------------- */
 app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
     try {
         // ensure user row exists
@@ -423,7 +479,7 @@ app.post('/comments', requireAuth(), requireExactCareDomain, async (req, res) =>
     }
 });
 
-// ---- Proxies (unchanged) ----
+/* ---------------- Proxies (unchanged) ---------------- */
 app.use('/proxy/rxnav', async (req, res) => {
     const targetUrl = `https://rxnav.nlm.nih.gov/REST${req.url}`;
     try {

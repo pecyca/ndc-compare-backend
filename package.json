@@ -8,9 +8,9 @@
     "postinstall": "npm rebuild sqlite3 --build-from-source"
   },
   "dependencies": {
-    "@clerk/express": "^1.7.19",
     "cors": "^2.8.5",
     "express": "^4.21.2",
+    "jose": "^5.10.0",
     "node-fetch": "^3.3.2",
     "sqlite": "^5.1.1",
     "sqlite3": "^5.1.7"
