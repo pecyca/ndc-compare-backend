@@ -7,6 +7,7 @@ import { open } from 'sqlite';
 import path from 'path';
 import fetch from 'node-fetch';
 import fs from 'fs';
+import 'dotenv/config';
 import { fileURLToPath } from 'url';
 
 import {
