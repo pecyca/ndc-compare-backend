@@ -8,6 +8,7 @@ import path from 'path';
 import fetch from 'node-fetch';
 import fs from 'fs';
 import 'dotenv/config';
+import { requirePermission } from './middleware/requirePermission.js';
 import { fileURLToPath } from 'url';
 
 import {
@@ -416,7 +417,6 @@ app.post('/admin/reload-ndc-backup/', async (req, res) => {
 /* ---------------- Auth & comments ---------------- */
 app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
     try {
-        // ensure user row exists
         await db.run(
             `INSERT INTO users (email, displayName, isApprovedCommenter)
        VALUES (?, ?, 0)
@@ -424,16 +424,22 @@ app.get('/me', requireAuth(), requireExactCareDomain, async (req, res) => {
             [req.userEmail, req.userName]
         );
         const row = await db.get('SELECT * FROM users WHERE email = ?', [req.userEmail]);
+
+        const perms = Array.isArray(req.user?.permissions) ? req.user.permissions : [];
+        const canWrite = perms.includes('comment:write');
+        const isApproved = canWrite || row?.isApprovedCommenter === 1;
+
         res.json({
             email: req.userEmail,
             displayName: req.userName,
-            isApprovedCommenter: row?.isApprovedCommenter === 1,
+            isApprovedCommenter: isApproved
         });
     } catch (e) {
         console.error('❌ /me error:', e);
         res.status(500).json({ error: 'Internal error' });
     }
 });
+
 
 app.get('/comments', requireAuth(), requireExactCareDomain, async (req, res) => {
     const { normalizedNDC, gpiCode } = req.query;
@@ -459,7 +465,8 @@ app.get('/comments', requireAuth(), requireExactCareDomain, async (req, res) => 
     }
 });
 
-app.post('/comments', requireAuth(), requireExactCareDomain, async (req, res) => {
+// Create comment (must have comment:write)
+app.post('/comments', requireAuth(), requireExactCareDomain, requirePermission('comment:write'), async (req, res) => {
     const { normalizedNDC, gpiCode, scope, comment } = req.body;
     if (!['ndc', 'gpi'].includes(scope)) return res.status(400).json({ error: 'Invalid scope' });
     if (!comment) return res.status(400).json({ error: 'Missing comment' });
@@ -479,6 +486,18 @@ app.post('/comments', requireAuth(), requireExactCareDomain, async (req, res) =>
         res.status(500).json({ error: 'Internal error' });
     }
 });
+
+// Delete comment (must have comment:delete)
+app.delete('/comments/:id', requireAuth(), requireExactCareDomain, requirePermission('comment:delete'), async (req, res) => {
+    try {
+        await db.run(`DELETE FROM comments WHERE id = ?`, [req.params.id]);
+        res.json({ ok: true });
+    } catch (err) {
+        console.error('❌ DELETE /comments error:', err);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
 
 /* ---------------- Proxies (unchanged) ---------------- */
 app.use('/proxy/rxnav', async (req, res) => {
